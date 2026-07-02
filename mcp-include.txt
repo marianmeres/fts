@@ -1,0 +1,4 @@
+PostgreSQL-backed full-text search presenting as a tenant-scoped, searchable key-value
+store — ranked, weighted, typo-tolerant (pg_trgm) search over generated tsvector columns
+with composite btree_gin indexes; app-side normalization via @marianmeres/searchable,
+no external search engine.
