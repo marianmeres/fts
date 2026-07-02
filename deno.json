@@ -1,6 +1,6 @@
 {
   "name": "@marianmeres/fts",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "exports": "./src/mod.ts",
   "publish": {
     "exclude": [
