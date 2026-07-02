@@ -171,6 +171,8 @@ export interface SearchOptions {
 /** A single ranked search result. */
 export interface SearchHit {
 	key: string;
+	/** The scope the hit lives in (useful when searching multiple scopes at once). */
+	scope: string;
 	value: unknown;
 	rank: number;
 }

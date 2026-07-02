@@ -286,14 +286,16 @@ export class Fts {
 		return rowCount ?? 0;
 	}
 
-	/** Count rows in a tenant (optionally narrowed to one scope). */
-	async count(tenantId: string, scope?: string): Promise<number> {
+	/** Count rows in a tenant (optionally narrowed to one scope, or several). */
+	async count(tenantId: string, scope?: string | string[]): Promise<number> {
 		this.#assertInitialized();
 		this.#assertStr(tenantId, "tenantId");
 		const where = scope === undefined
 			? `tenant_id = $1`
-			: `tenant_id = $1 AND scope = $2`;
-		const params = scope === undefined ? [tenantId] : [tenantId, scope];
+			: `tenant_id = $1 AND scope = ANY($2)`;
+		const params = scope === undefined
+			? [tenantId]
+			: [tenantId, this.#resolveScopes(scope)];
 		const { rows } = await this.#db.query(
 			`SELECT COUNT(*)::int AS count FROM ${this.config.tableName} WHERE ${where}`,
 			params,
@@ -306,7 +308,8 @@ export class Fts {
 	// -----------------------------------------------------------------------
 
 	/**
-	 * Search one `(tenantId, scope)` and return ranked hits.
+	 * Search one `(tenantId, scope)` — or several scopes at once when `scope` is an
+	 * array — and return ranked hits.
 	 *
 	 * - `prefix` (default): index-backed typeahead (`'word':*`). Only sound on
 	 *   `simple`-config languages — rejected on stemmed configs (PostgreSQL stems
@@ -315,18 +318,24 @@ export class Fts {
 	 * - `fuzzy`: `pg_trgm` word-similarity (substring + typo tolerance); requires
 	 *   the store's `fuzzy` option; threshold via `trgmThreshold` (default 0.6).
 	 *
+	 * Multi-scope search is the "subtree" primitive for hierarchical scope
+	 * conventions (e.g. dotted scopes): enumerate the descendant scopes app-side and
+	 * pass them as an array — `scope = ANY(...)` rides the same composite GIN index
+	 * as the single-scope path. Scopes are matched literally; there is NO pattern
+	 * matching here (a `%` or `*` in a scope is just a character).
+	 *
 	 * A query that normalizes to zero lexemes returns an empty result (never a
 	 * full-scope dump, never a `to_tsquery('')` error).
 	 */
 	async search(
 		tenantId: string,
-		scope: string,
+		scope: string | string[],
 		query: string,
 		opts: SearchOptions = {},
 	): Promise<SearchResult> {
 		this.#assertInitialized();
 		this.#assertStr(tenantId, "tenantId");
-		this.#assertStr(scope, "scope");
+		const scopes = this.#resolveScopes(scope);
 
 		const mode = opts.mode ?? "prefix";
 		const limit = Math.max(0, Math.floor(opts.limit ?? 20));
@@ -339,7 +348,7 @@ export class Fts {
 		if (typeof query !== "string" || !query.trim().length) return empty;
 
 		if (mode === "fuzzy") {
-			return await this.#searchFuzzy(tenantId, scope, query, {
+			return await this.#searchFuzzy(tenantId, scopes, query, {
 				limit,
 				offset,
 				withTotal,
@@ -382,15 +391,16 @@ export class Fts {
 		const col = `tsv_${lang}`; // lang is whitelisted; never raw user input
 
 		const { rows } = await this.#db.query(
-			`SELECT key, value, ${rankFn}($1::float4[], ${col}, q)::float8 AS rank
+			`SELECT key, scope, value, ${rankFn}($1::float4[], ${col}, q)::float8 AS rank
 			FROM ${tableName}, to_tsquery($2::regconfig, $3) q
-			WHERE tenant_id = $4 AND scope = $5 AND ${col} @@ q
-			ORDER BY rank DESC, updated_at DESC, key ASC
+			WHERE tenant_id = $4 AND scope = ANY($5) AND ${col} @@ q
+			ORDER BY rank DESC, updated_at DESC, scope ASC, key ASC
 			LIMIT $6 OFFSET $7`,
-			[weights, tsConfig, qtext, tenantId, scope, limit, offset],
+			[weights, tsConfig, qtext, tenantId, scopes, limit, offset],
 		);
 		const hits = rows.map((r) => ({
 			key: r.key as string,
+			scope: r.scope as string,
 			value: r.value as unknown,
 			rank: Number(r.rank),
 		}));
@@ -400,8 +410,8 @@ export class Fts {
 		const { rows: cnt } = await this.#db.query(
 			`SELECT COUNT(*)::int AS count
 			FROM ${tableName}, to_tsquery($1::regconfig, $2) q
-			WHERE tenant_id = $3 AND scope = $4 AND ${col} @@ q`,
-			[tsConfig, qtext, tenantId, scope],
+			WHERE tenant_id = $3 AND scope = ANY($4) AND ${col} @@ q`,
+			[tsConfig, qtext, tenantId, scopes],
 		);
 		return { hits, total: cnt[0]?.count ?? 0, limit, offset };
 	}
@@ -417,7 +427,7 @@ export class Fts {
 	 */
 	async #searchFuzzy(
 		tenantId: string,
-		scope: string,
+		scopes: string[],
 		query: string,
 		o: {
 			limit: number;
@@ -448,15 +458,16 @@ export class Fts {
 				[String(threshold)],
 			);
 			const { rows } = await c.query(
-				`SELECT key, value, word_similarity($1, fts_trgm)::float8 AS rank
+				`SELECT key, scope, value, word_similarity($1, fts_trgm)::float8 AS rank
 				FROM ${tableName}
-				WHERE tenant_id = $2 AND scope = $3 AND $1 <% fts_trgm
-				ORDER BY rank DESC, updated_at DESC, key ASC
+				WHERE tenant_id = $2 AND scope = ANY($3) AND $1 <% fts_trgm
+				ORDER BY rank DESC, updated_at DESC, scope ASC, key ASC
 				LIMIT $4 OFFSET $5`,
-				[qNorm, tenantId, scope, o.limit, o.offset],
+				[qNorm, tenantId, scopes, o.limit, o.offset],
 			);
 			const hits = rows.map((r) => ({
 				key: r.key as string,
+				scope: r.scope as string,
 				value: r.value as unknown,
 				rank: Number(r.rank),
 			}));
@@ -465,8 +476,8 @@ export class Fts {
 
 			const { rows: cnt } = await c.query(
 				`SELECT COUNT(*)::int AS count FROM ${tableName}
-				WHERE tenant_id = $2 AND scope = $3 AND $1 <% fts_trgm`,
-				[qNorm, tenantId, scope],
+				WHERE tenant_id = $2 AND scope = ANY($3) AND $1 <% fts_trgm`,
+				[qNorm, tenantId, scopes],
 			);
 			return {
 				hits,
@@ -564,6 +575,22 @@ export class Fts {
 		if (typeof value !== "string" || !value.length) {
 			throw new Error(`fts: ${what} must be a non-empty string.`);
 		}
+	}
+
+	/**
+	 * Normalize the read-path `scope` argument (`string | string[]`) into a validated,
+	 * deduped, non-empty array of literal scope values (fed to `scope = ANY(...)`).
+	 */
+	#resolveScopes(scope: string | string[]): string[] {
+		if (!Array.isArray(scope)) {
+			this.#assertStr(scope, "scope");
+			return [scope];
+		}
+		if (!scope.length) {
+			throw new Error(`fts: scope array must contain at least one scope.`);
+		}
+		for (const s of scope) this.#assertStr(s, "scope");
+		return [...new Set(scope)];
 	}
 
 	/** Whitelist the language key (the dead-\`__tsv_en\` scar — never guess a column). */
