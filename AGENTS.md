@@ -20,6 +20,7 @@ src/_tsquery.ts   — query groups → safe tsquery string (internal)
 src/_pg.ts        — PgExecutor seam, isPool/acquireClient/withTx (internal)
 tests/_pg.ts      — createPg() from TEST_PG_* env
 tests/_fts.ts     — makeFts/freshStore/withStore helpers, noopLogger
+example/          — movie search playground (demino REST server + vanilla client); `deno task example`, see example/README.md
 tmp/              — initial spec, implementation plan, spike results (git-ignored, local only)
 ```
 
@@ -29,17 +30,17 @@ tmp/              — initial spec, implementation plan, spike results (git-igno
 
 One table (default `__fts`), self-provisioned by `initialize()` (`IF NOT EXISTS`, idempotent; no @marianmeres/migrate):
 
-| Column | Type | Notes |
-|---|---|---|
-| `tenant_id` | `VARCHAR(255) NOT NULL DEFAULT '_default'` | Hard isolation axis; NOT a FK (matches cron). |
-| `scope` | `TEXT NOT NULL` | Logical bucket within a tenant. |
-| `key` | `TEXT NOT NULL` | Identity within scope. **PK = (tenant_id, scope, key)**. |
-| `lang` | `VARCHAR(32)` | Selects which `tsv_<lang>` populates (CASE guard in the generated column). |
-| `content` | `JSONB NOT NULL` | App-normalized (searchable) field text — the tsvector source. |
-| `value` | `JSONB` | Opaque payload returned to callers. |
-| `tsv_<lang>` | `tsvector GENERATED ... STORED` | One per configured language; weighted `setweight(to_tsvector('<cfg>', content->>'<field>'), '<W>')`. |
-| `fts_trgm` | `text GENERATED ... STORED` | Concatenated fields for pg_trgm (only when `fuzzy`). |
-| `created_at` / `updated_at` | `TIMESTAMPTZ DEFAULT NOW()` | `updated_at` bumped on every upsert. |
+| Column                      | Type                                       | Notes                                                                                                |
+| --------------------------- | ------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| `tenant_id`                 | `VARCHAR(255) NOT NULL DEFAULT '_default'` | Hard isolation axis; NOT a FK (matches cron).                                                        |
+| `scope`                     | `TEXT NOT NULL`                            | Logical bucket within a tenant.                                                                      |
+| `key`                       | `TEXT NOT NULL`                            | Identity within scope. **PK = (tenant_id, scope, key)**.                                             |
+| `lang`                      | `VARCHAR(32)`                              | Selects which `tsv_<lang>` populates (CASE guard in the generated column).                           |
+| `content`                   | `JSONB NOT NULL`                           | App-normalized (searchable) field text — the tsvector source.                                        |
+| `value`                     | `JSONB`                                    | Opaque payload returned to callers.                                                                  |
+| `tsv_<lang>`                | `tsvector GENERATED ... STORED`            | One per configured language; weighted `setweight(to_tsvector('<cfg>', content->>'<field>'), '<W>')`. |
+| `fts_trgm`                  | `text GENERATED ... STORED`                | Concatenated fields for pg_trgm (only when `fuzzy`).                                                 |
+| `created_at` / `updated_at` | `TIMESTAMPTZ DEFAULT NOW()`                | `updated_at` bumped on every upsert.                                                                 |
 
 Indexes: `idx_<safe(tableName)>_tsv_<lang>` = `gin (tenant_id, scope, tsv_<lang>)` (needs `btree_gin`); `idx_<safe(tableName)>_trgm` = `gin (tenant_id, scope, fts_trgm gin_trgm_ops)`. `safe()` = `\W → _`.
 

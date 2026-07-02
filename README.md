@@ -13,7 +13,7 @@ third-party search engine. It's just a Postgres table.
   `prefix` (typeahead), `exact`, and opt-in `fuzzy` (typo-tolerant) modes.
 - **Predictable by design**: normalization (case/accent folding, stopwords) happens
   app-side via [@marianmeres/searchable](https://github.com/marianmeres/searchable)
-  — identically at write and query time. PostgreSQL does the *indexed matching*
+  — identically at write and query time. PostgreSQL does the _indexed matching_
   (generated `tsvector` columns + composite `btree_gin` indexes), not linguistics.
 - **Multi-tenant safe**: `tenant_id` is part of the primary key, every index, and a
   required argument of every method — no operation can cross tenants.
@@ -42,7 +42,7 @@ npm i @marianmeres/fts
 import pg from "pg";
 import { createFts } from "@marianmeres/fts";
 
-const db = new pg.Pool({ /* connection */ });
+const db = new pg.Pool({/* connection */});
 const fts = createFts({ db });
 await fts.initialize(); // idempotent: creates table + indexes
 
@@ -82,6 +82,16 @@ const fts = createFts({
 > search predictable. Stemmed configs (like `english`) are an explicit opt-in and only
 > support `exact` mode — PostgreSQL stems before the prefix is applied, so
 > partial-word prefixes would silently miss. See [API.md](API.md) for details.
+
+## Example app
+
+A runnable end-to-end demo — REST server + browser client searching ~2.5k movies,
+exercising all three modes (with rank display and match highlighting) — lives in
+[example/](example/):
+
+```shell
+deno task example
+```
 
 ## API
 

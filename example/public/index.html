@@ -1,0 +1,628 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+		<title>@marianmeres/fts — movie search playground</title>
+		<script type="importmap">
+			{
+				"imports": {
+					"@marianmeres/vanilla": "https://esm.sh/@marianmeres/vanilla@1"
+				}
+			}
+		</script>
+		<style>
+			:root {
+				--fg: #1e293b;
+				--fg-soft: #64748b;
+				--fg-faint: #94a3b8;
+				--bg: #f8fafc;
+				--card: #ffffff;
+				--border: #e2e8f0;
+				--accent: #4f46e5;
+				--accent-soft: #eef2ff;
+			}
+			* {
+				box-sizing: border-box;
+			}
+			body {
+				margin: 0;
+				background: var(--bg);
+				color: var(--fg);
+				font: 15px/1.5 system-ui, -apple-system, sans-serif;
+			}
+			.wrap {
+				max-width: 680px;
+				margin: 0 auto;
+				padding: 2.5rem 1.25rem 4rem;
+			}
+			header h1 {
+				margin: 0;
+				font-size: 1.4rem;
+			}
+			header p {
+				margin: 0.25rem 0 1.5rem;
+				color: var(--fg-soft);
+				font-size: 0.85rem;
+			}
+			input[type="search"] {
+				width: 100%;
+				padding: 0.65rem 0.9rem;
+				font: inherit;
+				font-size: 1.05rem;
+				border: 1px solid var(--border);
+				border-radius: 0.5rem;
+				background: var(--card);
+				outline-offset: 1px;
+			}
+			input[type="search"]:focus {
+				outline: 2px solid var(--accent);
+			}
+			.controls {
+				display: flex;
+				align-items: center;
+				gap: 1.25rem;
+				flex-wrap: wrap;
+				margin: 0.75rem 0 0.35rem;
+				font-size: 0.85rem;
+				color: var(--fg-soft);
+			}
+			.mode-desc {
+				margin: 0 0 1.25rem;
+				font-size: 0.78rem;
+				color: var(--fg-faint);
+			}
+			.controls label {
+				display: inline-flex;
+				align-items: center;
+				gap: 0.3rem;
+				cursor: pointer;
+			}
+			.controls input[type="radio"] {
+				accent-color: var(--accent);
+			}
+			.threshold {
+				display: inline-flex;
+				align-items: center;
+				gap: 0.5rem;
+			}
+			.threshold input[type="range"] {
+				accent-color: var(--accent);
+				width: 8rem;
+			}
+			.threshold.hidden {
+				display: none;
+			}
+			.meta {
+				display: flex;
+				justify-content: space-between;
+				align-items: baseline;
+				gap: 1rem;
+				margin-bottom: 0.6rem;
+				font-size: 0.8rem;
+				color: var(--fg-faint);
+				min-height: 1.2rem;
+			}
+			.meta .error {
+				color: #dc2626;
+			}
+			ul.hits {
+				list-style: none;
+				margin: 0;
+				padding: 0;
+				display: flex;
+				flex-direction: column;
+				gap: 0.5rem;
+				transition: opacity 0.15s;
+			}
+			ul.hits[aria-busy="true"] {
+				opacity: 0.45;
+			}
+			ul.hits li {
+				background: var(--card);
+				border: 1px solid var(--border);
+				border-radius: 0.5rem;
+				padding: 0.7rem 0.9rem;
+				cursor: pointer;
+			}
+			ul.hits li:hover {
+				border-color: var(--accent);
+			}
+			.hit-head {
+				display: flex;
+				align-items: baseline;
+				gap: 0.5rem;
+			}
+			.hit-title {
+				font-weight: 600;
+			}
+			.hit-year {
+				color: var(--fg-faint);
+				font-size: 0.85rem;
+			}
+			.hit-rank {
+				margin-left: auto;
+				font: 0.72rem/1.6 ui-monospace, monospace;
+				background: var(--accent-soft);
+				color: var(--accent);
+				border-radius: 0.4rem;
+				padding: 0 0.45rem;
+				white-space: nowrap;
+			}
+			.hit-tagline {
+				margin: 0.15rem 0 0;
+				color: var(--fg-soft);
+				font-size: 0.85rem;
+			}
+			.hit-overview {
+				margin: 0.15rem 0 0;
+				color: var(--fg-soft);
+				font-size: 0.8rem;
+				display: -webkit-box;
+				-webkit-line-clamp: 2;
+				-webkit-box-orient: vertical;
+				overflow: hidden;
+			}
+			.hit-meta {
+				margin: 0.25rem 0 0;
+				font-size: 0.78rem;
+				color: var(--fg-faint);
+			}
+			.hit-meta .lbl {
+				display: inline-block;
+				min-width: 3.6rem;
+				font-size: 0.62rem;
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+			}
+			mark {
+				background: #fde68a;
+				color: inherit;
+				border-radius: 2px;
+				padding: 0 1px;
+			}
+			.detail {
+				margin-top: 0.6rem;
+				padding-top: 0.6rem;
+				border-top: 1px dashed var(--border);
+				font-size: 0.85rem;
+				cursor: auto;
+			}
+			.detail p {
+				margin: 0 0 0.5rem;
+			}
+			.detail dl {
+				display: grid;
+				grid-template-columns: max-content 1fr;
+				gap: 0.15rem 0.75rem;
+				margin: 0;
+			}
+			.detail dt {
+				color: var(--fg-faint);
+			}
+			.detail dd {
+				margin: 0;
+			}
+			.pager {
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				gap: 1rem;
+				margin-top: 1.25rem;
+				font-size: 0.85rem;
+				color: var(--fg-soft);
+			}
+			.pager button {
+				font: inherit;
+				padding: 0.3rem 0.9rem;
+				border: 1px solid var(--border);
+				border-radius: 0.4rem;
+				background: var(--card);
+				cursor: pointer;
+			}
+			.pager button:not(:disabled):hover {
+				border-color: var(--accent);
+				color: var(--accent);
+			}
+			.pager button:disabled {
+				opacity: 0.4;
+				cursor: default;
+			}
+			.msg {
+				color: var(--fg-faint);
+				text-align: center;
+				padding: 2.5rem 0;
+			}
+			.hidden {
+				display: none;
+			}
+		</style>
+	</head>
+	<body>
+		<div class="wrap">
+			<header>
+				<h1>Movie search</h1>
+				<p>
+					<a href="https://github.com/marianmeres/fts">@marianmeres/fts</a>
+					playground · demino · vanilla ·
+					<span data-count>…</span> movies indexed
+				</p>
+			</header>
+
+			<template id="tpl-app">
+				<div>
+					<input
+						type="search"
+						data-ref="input"
+						data-on="input:query"
+						placeholder="Search movies… (title, cast, plot, genres)"
+						autofocus
+					/>
+
+					<div class="controls">
+						<span>
+							<label>
+								<input
+									type="radio"
+									name="mode"
+									value="prefix"
+									data-on="change:mode"
+									checked
+								/>
+								prefix
+							</label>
+							<label>
+								<input
+									type="radio"
+									name="mode"
+									value="exact"
+									data-on="change:mode"
+								/>
+								exact
+							</label>
+							<label>
+								<input
+									type="radio"
+									name="mode"
+									value="fuzzy"
+									data-on="change:mode"
+								/>
+								fuzzy
+							</label>
+						</span>
+						<span class="threshold hidden" data-ref="thresholdBox">
+							threshold
+							<input
+								type="range"
+								min="0.1"
+								max="1"
+								step="0.05"
+								value="0.6"
+								data-on="input:threshold"
+							/>
+							<span data-ref="thresholdValue">0.6</span>
+						</span>
+					</div>
+
+					<p class="mode-desc" data-ref="modeDesc"></p>
+
+					<div class="meta">
+						<span data-ref="status"></span>
+						<span data-ref="range"></span>
+					</div>
+
+					<ul class="hits" data-ref="hits" aria-live="polite"></ul>
+					<p class="msg hidden" data-ref="msg"></p>
+
+					<div class="pager hidden" data-ref="pager">
+						<button data-on="click:prev" data-ref="prev">‹ prev</button>
+						<button data-on="click:next" data-ref="next">next ›</button>
+					</div>
+				</div>
+			</template>
+
+			<template id="tpl-hit">
+				<li>
+					<div class="hit-head">
+						<span class="hit-title"></span>
+						<span class="hit-year"></span>
+						<span class="hit-rank"></span>
+					</div>
+					<p class="hit-tagline"></p>
+					<p class="hit-overview"></p>
+					<p class="hit-meta">
+						<span class="lbl">people</span><span class="hit-people"></span>
+					</p>
+					<p class="hit-meta">
+						<span class="lbl">genres</span><span class="hit-genres"></span>
+					</p>
+				</li>
+			</template>
+
+			<template id="tpl-detail">
+				<div class="detail">
+					<p data-bind="text:overview"></p>
+					<dl>
+						<dt>Genres</dt>
+						<dd data-bind="text:genres"></dd>
+						<dt>Directors</dt>
+						<dd data-bind="text:directors"></dd>
+						<dt>Actors</dt>
+						<dd data-bind="text:actors"></dd>
+						<dt>Characters</dt>
+						<dd data-bind="text:characters"></dd>
+					</dl>
+				</div>
+			</template>
+
+			<div id="app"></div>
+		</div>
+
+		<script type="module">
+			import {
+				applyBindings,
+				computed,
+				createView,
+				delegate,
+				fromTemplate,
+				observable,
+				reactTo,
+				refs,
+			} from "@marianmeres/vanilla";
+
+			const LIMIT = 10;
+
+			// What each search strategy does (rendered under the mode switch).
+			const MODE_INFO = {
+				prefix:
+					"Typeahead matching: every query word matches as a word prefix (“kni” finds “Knight”), multiple words are AND-ed. Index-backed — this is the default mode.",
+				exact:
+					"Whole-word matching: “alien” matches, “alie” does not. Useful when prefix matching is too eager.",
+				fuzzy:
+					"Trigram word-similarity (pg_trgm): typo-tolerant and substring-capable — “harison frod” still finds Harrison Ford. The threshold sets how loose a match may be (lower = looser, more results).",
+			};
+
+			/* ----------------------------------------------------------------
+			 * STATE — plain observables; the search effect below reacts to them.
+			 * ---------------------------------------------------------------- */
+			const query = observable("");
+			const mode = observable("prefix");
+			const threshold = observable(0.6);
+			const offset = observable(0);
+			const request = observable({ status: "idle", result: null, error: null });
+
+			const isFuzzy = computed([mode], () => mode.get() === "fuzzy");
+
+			/* ----------------------------------------------------------------
+			 * SEARCH — one AbortController per call (last-request-wins), so a
+			 * slow response can never overwrite a newer one.
+			 * ---------------------------------------------------------------- */
+			let controller = null;
+
+			async function doSearch() {
+				controller?.abort();
+
+				const q = query.get().trim();
+				if (!q) {
+					request.set({ status: "idle", result: null, error: null });
+					return;
+				}
+
+				controller = new AbortController();
+				request.update((r) => ({ ...r, status: "loading" }));
+
+				const params = new URLSearchParams({
+					q,
+					mode: mode.get(),
+					limit: LIMIT,
+					offset: offset.get(),
+				});
+				if (mode.get() === "fuzzy") params.set("threshold", threshold.get());
+
+				try {
+					const res = await fetch(`/api/search?${params}`, {
+						signal: controller.signal,
+					});
+					const json = await res.json();
+					if (!res.ok) throw new Error(json?.error || `HTTP ${res.status}`);
+					request.set({ status: "success", result: json, error: null });
+				} catch (err) {
+					if (err?.name === "AbortError") return; // superseded
+					request.set({ status: "error", result: null, error: String(err.message ?? err) });
+				}
+			}
+
+			/* ----------------------------------------------------------------
+			 * MATCH HIGHLIGHTING — every indexed field is rendered in the hit
+			 * row with the query words <mark>ed, so it is visible WHY a hit
+			 * matched. Client-side approximation of the server-side matching:
+			 * diacritics-folded, case-insensitive prefix — a fuzzy typo
+			 * ("harison") can therefore match without getting a highlight.
+			 * ---------------------------------------------------------------- */
+			const fold = (s) =>
+				s.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+
+			const queryWords = (q) =>
+				[...new Set(fold(q).split(/[^\p{L}\p{N}@-]+/u).filter(Boolean))];
+
+			// Fills `el` with `text`, wrapping matched words in <mark> (built as
+			// DOM nodes, never as an html string).
+			function markInto(el, text, words) {
+				el.textContent = "";
+				// split with a capture group -> odd indexes are the word chunks
+				text.split(/([\p{L}\p{N}@-]+)/u).forEach((chunk, i) => {
+					if (!chunk) return;
+					if (i % 2 && words.some((w) => fold(chunk).startsWith(w))) {
+						const m = document.createElement("mark");
+						m.textContent = chunk;
+						el.appendChild(m);
+					} else {
+						el.appendChild(document.createTextNode(chunk));
+					}
+				});
+			}
+
+			// One field row within a hit: fill + hide the whole row when empty.
+			function setRow(li, selector, text, words) {
+				const el = li.querySelector(selector);
+				el.closest("p").classList.toggle("hidden", !text);
+				if (text) markInto(el, text, words);
+			}
+
+			/* ----------------------------------------------------------------
+			 * VIEW
+			 * ---------------------------------------------------------------- */
+			const app = createView((track) => {
+				const el = fromTemplate("tpl-app");
+				const r = refs(el);
+
+				// Debounced typeahead: the observable is set ~200ms after the last
+				// keystroke; everything else (mode, slider, paging) fires instantly.
+				let timer = null;
+				track(() => clearTimeout(timer));
+
+				track(
+					delegate(el, {
+						query: (_e, t) => {
+							clearTimeout(timer);
+							timer = setTimeout(() => {
+								offset.set(0);
+								query.set(t.value);
+							}, 200);
+						},
+						mode: (_e, t) => {
+							offset.set(0);
+							mode.set(t.value);
+						},
+						threshold: (_e, t) => {
+							offset.set(0);
+							threshold.set(parseFloat(t.value));
+						},
+						prev: () => offset.update((o) => Math.max(0, o - LIMIT)),
+						next: () => offset.update((o) => o + LIMIT),
+						// toggle per-movie detail (fetched lazily via GET /api/movies/:id)
+						hit: async (_e, t) => {
+							const li = t.closest("[data-key]");
+							const existing = li.querySelector(".detail");
+							if (existing) return existing.remove();
+							const res = await fetch(`/api/movies/${li.dataset.key}`);
+							if (!res.ok) return;
+							const m = await res.json();
+							const node = fromTemplate("tpl-detail");
+							applyBindings(node, {
+								overview: m.overview || "—",
+								genres: (m.genres ?? []).join(", ") || "—",
+								directors: (m.directors ?? []).join(", ") || "—",
+								actors: (m.actors ?? []).join(", ") || "—",
+								characters: (m.characters ?? []).join(", ") || "—",
+							});
+							if (li.isConnected) li.appendChild(node);
+						},
+					}),
+				);
+
+				// THE search effect: any input change lands here (batched — a
+				// handler setting offset + query still triggers exactly one run).
+				track(reactTo([query, mode, threshold, offset], doSearch));
+
+				// Mode description + fuzzy-only controls visibility.
+				track(
+					mode.subscribe((m) => {
+						r.modeDesc.textContent = MODE_INFO[m];
+					}),
+				);
+				track(
+					isFuzzy.subscribe((fuzzy) => {
+						r.thresholdBox.classList.toggle("hidden", !fuzzy);
+					}),
+				);
+				track(
+					threshold.subscribe((t) => {
+						r.thresholdValue.textContent = t.toFixed(2);
+					}),
+				);
+
+				// RESULTS — container-level re-render from the request status.
+				track(reactTo([request], renderResults));
+
+				function renderResults() {
+					const { status, result, error } = request.get();
+
+					// While loading just dim the current list (no flicker on typeahead).
+					r.hits.setAttribute("aria-busy", status === "loading" ? "true" : "false");
+					if (status === "loading") return;
+
+					r.hits.innerHTML = "";
+					r.status.textContent = "";
+					r.status.classList.toggle("error", status === "error");
+					r.range.textContent = "";
+					r.msg.classList.add("hidden");
+					r.pager.classList.add("hidden");
+
+					if (status === "idle") {
+						r.msg.textContent = "Start typing to search.";
+						r.msg.classList.remove("hidden");
+						return;
+					}
+					if (status === "error") {
+						r.status.textContent = error;
+						return;
+					}
+
+					const { hits, total, elapsedMs } = result;
+					r.status.textContent = `${total} match${total === 1 ? "" : "es"} · ${elapsedMs} ms`;
+
+					if (!hits.length) {
+						r.msg.textContent = "No matches.";
+						r.msg.classList.remove("hidden");
+						return;
+					}
+
+					const words = queryWords(query.get());
+					hits.forEach(({ key, value: m, rank }) => {
+						const li = fromTemplate("tpl-hit");
+						li.dataset.key = key;
+						li.dataset.on = "click:hit";
+						li.querySelector(".hit-year").textContent = m.year ? `(${m.year})` : "";
+						li.querySelector(".hit-rank").textContent = rank.toFixed(3);
+						markInto(li.querySelector(".hit-title"), m.title || "(untitled)", words);
+						setRow(li, ".hit-tagline", m.tagline, words);
+						setRow(li, ".hit-overview", m.overview, words);
+						// the same concatenations the server indexes as `people` + `genres`
+						setRow(
+							li,
+							".hit-people",
+							[m.directors, m.actors, m.characters].flat().filter(Boolean).join(", "),
+							words,
+						);
+						setRow(li, ".hit-genres", (m.genres ?? []).join(", "), words);
+						r.hits.appendChild(li);
+					});
+
+					const from = result.offset + 1;
+					const to = result.offset + hits.length;
+					r.range.textContent = `${from}–${to} of ${total}`;
+					r.pager.classList.toggle("hidden", total <= LIMIT);
+					r.prev.disabled = result.offset === 0;
+					r.next.disabled = to >= total;
+				}
+
+				return { el };
+			});
+
+			document.getElementById("app").appendChild(app.el);
+
+			// Header stats — page-lifetime, intentionally outside the view.
+			fetch("/api/stats")
+				.then((res) => res.json())
+				.then(({ count }) => {
+					document.querySelector("[data-count]").textContent = count;
+				})
+				.catch(() => {});
+
+			// expose for console poking
+			globalThis.app = app;
+			globalThis.state = { query, mode, threshold, offset, request };
+		</script>
+	</body>
+</html>
