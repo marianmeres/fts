@@ -47,7 +47,7 @@ Indexes: `idx_<safe(tableName)>_tsv_<lang>` = `gin (tenant_id, scope, tsv_<lang>
 ## Critical Conventions
 
 1. **Tenant isolation is structural**: `tenantId` is a required positional first arg on EVERY data method and appears in every `WHERE`. Never add a method that omits it (cross-tenant purge must be a distinct, loud method like `deleteTenant`).
-2. **Normalization parity**: ONE `Searchable` instance (`fts.searchable`) at write (`toWords`) and query (`toQueryGroups`) time; the same explicit PG config on both sides (generated column and `to_tsquery($cfg::regconfig, ...)`). Never normalize differently on one side.
+2. **Normalization parity**: ONE `Searchable` instance (`fts.searchable`) at write (`toWords`) and query (`toQueryGroups`) time; the same explicit PG config on both sides (generated column and `to_tsquery($cfg::regconfig, ...)`). Never normalize differently on one side. NOTE: PG's text-search parser is a SECOND tokenizer running after searchable on BOTH sides — `to_tsquery` re-parses even quoted lexemes (compounds like `pump_carb` become adjacency phrases; quoting stops operator injection, not re-tokenization). Parity holds only because both sides share the same two-tokenizer chain; semantics are pinned by `tests/parity-compound.test.ts`, human-facing detail in API.md → "Normalization parity".
 3. **Safe tsquery**: lexemes quoted (`'` doubled) in `_tsquery.ts`; the assembled string + config are BOUND as params. Zero-lexeme queries short-circuit to an empty result (`to_tsquery('')` throws).
 4. **Language whitelist**: `lang` is validated against configured `languages` keys before touching SQL — `tsv_<lang>` is spliced, never from raw input. Same for `tableName`/fields/configs (validated identifiers; DDL has no bind params).
 5. **`prefix` mode only on `simple` configs**: PG stems before applying `:*`, so prefix on a stemmed column silently misses — `search()` rejects that combination; `exact` works on stemmed.
@@ -58,7 +58,7 @@ Indexes: `idx_<safe(tableName)>_tsv_<lang>` = `gin (tenant_id, scope, tsv_<lang>
 
 ## Testing
 
-Real PostgreSQL (no mocks). `tests/_pg.ts` reads `TEST_PG_HOST/PORT/DATABASE/USER/PASSWORD` (see `.env.example`; `deno task test` = `deno test -A --env-file`). Extensions `btree_gin` + `pg_trgm` must exist in the test DB (superuser installs once; `CREATE EXTENSION IF NOT EXISTS` then no-ops for the test role). Each test uses `withStore()` → fresh table (`destroy(true)` + `initialize()`), own `tableName`, silent logger, `db.end()` cleanup. 58 tests across `fts` (CRUD + oversize), `schema` (DDL introspection), `search`, `language`, `fuzzy`, `tenant` (isolation).
+Real PostgreSQL (no mocks). `tests/_pg.ts` reads `TEST_PG_HOST/PORT/DATABASE/USER/PASSWORD` (see `.env.example`; `deno task test` = `deno test -A --env-file`). Extensions `btree_gin` + `pg_trgm` must exist in the test DB (superuser installs once; `CREATE EXTENSION IF NOT EXISTS` then no-ops for the test role). Each test uses `withStore()` → fresh table (`destroy(true)` + `initialize()`), own `tableName`, silent logger, `db.end()` cleanup. 66 tests across `fts` (CRUD + oversize), `schema` (DDL introspection), `search`, `parity-compound` (two-tokenizer round-trips + characterized edges), `language`, `fuzzy`, `tenant` (isolation).
 
 ## Key Exports
 

@@ -298,11 +298,50 @@ validated form of it exposed as `fts.config`.
 
 The same `Searchable` instance normalizes text at write time (`content` column) and
 query time (tsquery), and both sides use the same explicit PostgreSQL config — so
-write and query lexemes always agree *within PostgreSQL*. Nuance: PostgreSQL's parser
-re-splits compound tokens that searchable's `nonWordCharWhitelist` (`"@-"`) keeps
-whole — `well-known` is stored as `well`, `known` **and** `well-known` — so interior
-sub-token queries (`known`) match in fts even though standalone searchable would not.
-This is more permissive, not less.
+querying the tokens a document was indexed with finds it (tokens dropped by the
+`maxIndexedChars`/`maxIndexedLexemes` budgets are, by definition, not indexed).
+
+There are, however, **two tokenizers in the chain, not one**: searchable tokenizes
+first (app-side), then PostgreSQL's text-search parser re-parses the result on *both*
+sides — inside the generated `to_tsvector(...)` column at write time and inside
+`to_tsquery(...)` at query time. Quoting a lexeme in the tsquery prevents operator
+injection but does **not** make it literal: PostgreSQL re-parses inside the quotes and
+turns a compound token into an adjacency phrase, with `:*` applied to every fragment
+(`'pump_carb':*` → `'pump':* <-> 'carb':*`; verified on PostgreSQL 18.3). Round-trips
+stay consistent because both sides pass through the same two-tokenizer chain — but the
+phrase semantics show at the edges:
+
+- **Hyphens** (whitelisted by default, `"@-"`): PostgreSQL stores the compound *and*
+  its parts — `well-known` → `well-known`, `well`, `known` — so sub-token queries
+  (`known`) match. Conversely, the query side keeps the compound lexeme too, so
+  `well-known` does **not** match separate adjacent words (`"well known"`) — the
+  opposite of the underscore behavior below.
+- **Underscores** (in-word for searchable via `\p{Pc}`): PostgreSQL stores the *parts
+  only* — `pump_carb` → adjacent `pump`, `carb`. Querying `pump_carb` still matches,
+  but so does any document whose indexed token list happens to contain `pump`
+  directly followed by `carb` as two separate words — compound queries can
+  **false-positive on adjacent separate words** (`wire_harness` matches a
+  `"wire harness kit"` document). Note that `content` stores the deduped,
+  stopword-stripped token list, so "adjacent" refers to that list, not to the
+  original prose.
+- **Prefix mode on a partial compound** prefix-matches every fragment:
+  `pump_ca` → `'pump':* <-> 'ca':*`, which matches `pump_carb` *and* `"pump cable"`.
+  `exact` mode keeps them apart.
+- **Apostrophes are the sharp edge** (not whitelisted by default — keep it that way
+  unless the domain demands it): with
+  `'` whitelisted, a needle like `6'` collapses to the bare lexeme `6`, so a prefix
+  search for `6'` matches **every token starting with `6`** — a catalog of part
+  numbers is the worst case. Plain round-trips (`o'brien`) still work.
+- **Dots**: with the default whitelist searchable splits on `.` app-side, so `139.00`
+  queries as two AND-ed words (`'139' & '00'`) — order- and adjacency-insensitive,
+  i.e. it also matches a document containing `00 … 139` anywhere. With `.`
+  whitelisted, both searchable and PostgreSQL keep decimal-shaped tokens whole — one
+  strict lexeme. Round-trips work either way; strictness differs.
+
+Every character added to `nonWordCharWhitelist` creates tokens that searchable keeps
+whole but PostgreSQL may re-split — i.e. it widens this surface. Whitelist only what
+the domain needs. The exact semantics above are pinned by
+[`tests/parity-compound.test.ts`](tests/parity-compound.test.ts).
 
 ### tsvector byte cap (~1MB)
 

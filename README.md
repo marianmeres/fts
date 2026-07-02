@@ -13,8 +13,11 @@ third-party search engine. It's just a Postgres table.
   `prefix` (typeahead), `exact`, and opt-in `fuzzy` (typo-tolerant) modes.
 - **Predictable by design**: normalization (case/accent folding, stopwords) happens
   app-side via [@marianmeres/searchable](https://github.com/marianmeres/searchable)
-  — identically at write and query time. PostgreSQL does the _indexed matching_
-  (generated `tsvector` columns + composite `btree_gin` indexes), not linguistics.
+  — identically at write and query time — and PostgreSQL matches against generated
+  `tsvector` columns backed by composite `btree_gin` indexes. PostgreSQL's parser
+  does re-split compound tokens (`pump_carb`, `well-known`) on both sides; see the
+  [normalization parity notes](API.md#normalization-parity-the-core-invariant) for
+  the edge cases that follow.
 - **Multi-tenant safe**: `tenant_id` is part of the primary key, every index, and a
   required argument of every method — no operation can cross tenants.
 

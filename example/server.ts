@@ -3,10 +3,10 @@
  *
  * Example server for `@marianmeres/fts` — a movie search playground.
  *
- * On boot it connects to the `fts_movies` database (credentials come from the
- * same `TEST_PG_*` env vars the tests use), provisions the fts schema, seeds it
- * once from a movies JSON dump (~2.5k movies) and serves a tiny REST api plus
- * the static vanilla-js client from `./public`.
+ * On boot it connects to PostgreSQL via the `EXAMPLE_PG_*` env vars (see
+ * `.env.example`; database `fts_movies` by default), provisions the fts schema,
+ * seeds it once from a movies JSON dump (~2.5k movies) and serves a tiny REST
+ * api plus the static vanilla-js client from `./public`.
  *
  * Run from the repo root:
  *
@@ -30,7 +30,7 @@ import {
 
 const clog = createClog("fts-example");
 
-const DB_NAME = "fts_movies";
+const DB_NAME = Deno.env.get("EXAMPLE_PG_DATABASE") || "fts_movies";
 const SCOPE = "movies";
 const PORT = parseInt(Deno.env.get("PORT") || "8000", 10);
 const PUBLIC_DIR = fromFileUrl(new URL("./public", import.meta.url));
@@ -39,12 +39,11 @@ const PUBLIC_DIR = fromFileUrl(new URL("./public", import.meta.url));
 const MOVIES_JSON = Deno.env.get("MOVIES_JSON") ||
 	fromFileUrl(new URL("./movies.json", import.meta.url));
 
-// Same user/password as tests (see .env.example), only the database name differs.
 const db = new pg.Pool({
-	host: Deno.env.get("TEST_PG_HOST") || "localhost",
-	port: parseInt(Deno.env.get("TEST_PG_PORT") || "5432", 10),
-	user: Deno.env.get("TEST_PG_USER"),
-	password: Deno.env.get("TEST_PG_PASSWORD"),
+	host: Deno.env.get("EXAMPLE_PG_HOST") || "localhost",
+	port: parseInt(Deno.env.get("EXAMPLE_PG_PORT") || "5432", 10),
+	user: Deno.env.get("EXAMPLE_PG_USER"),
+	password: Deno.env.get("EXAMPLE_PG_PASSWORD"),
 	database: DB_NAME,
 });
 
@@ -77,7 +76,7 @@ async function initialize() {
 		clog.error(String(e));
 		clog.error(
 			`Is PostgreSQL running and does the "${DB_NAME}" database exist? If not:`,
-			`\n  psql -h localhost -U ${Deno.env.get("TEST_PG_USER")} -d postgres`,
+			`\n  psql -h localhost -U ${Deno.env.get("EXAMPLE_PG_USER")} -d postgres`,
 			`-c 'CREATE DATABASE ${DB_NAME}'`,
 		);
 		Deno.exit(1);

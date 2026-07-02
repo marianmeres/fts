@@ -101,6 +101,14 @@ export interface FtsOptions {
 	/**
 	 * The normalization brain. Either a ready `Searchable` instance or options to construct
 	 * one. The SAME instance is used at write and query time to keep lexemes in sync.
+	 *
+	 * CAUTION: every character added to `nonWordCharWhitelist` (default `"@-"`) creates
+	 * compound tokens that searchable keeps whole but PostgreSQL's parser MAY re-split
+	 * into adjacency phrases on both sides (underscore-style compounds and partial
+	 * emails split; full emails and decimal-shaped tokens survive whole), widening the
+	 * false-positive surface — see API.md → "Normalization parity". `'` is the sharpest:
+	 * whitelisted, a needle like `6'` collapses to the lexeme `6` and prefix-matches
+	 * every `6…` token. Whitelist only what the domain needs.
 	 */
 	searchable?: Searchable | Partial<SearchableOptions>;
 }

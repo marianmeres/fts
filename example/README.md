@@ -11,9 +11,9 @@ client is a search-as-you-type playground exercising all three search modes (`pr
 
 ## Prerequisites
 
-1. A running PostgreSQL with the same user/password the tests use (see
-   [`.env.example`](../.env.example) — copy to `.env` if you haven't).
-2. The `fts_movies` database (it is NOT auto-created):
+1. A running PostgreSQL reachable via the `EXAMPLE_PG_*` env vars (see
+   [`.env.example`](../.env.example) — copy to `.env` and fill in if you haven't).
+2. The configured database — `fts_movies` by default (it is NOT auto-created):
 
    ```sh
    psql -h localhost -U dbuser -d postgres -c 'CREATE DATABASE fts_movies'

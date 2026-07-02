@@ -10,6 +10,12 @@
  * Every lexeme is single-quoted (with `'` doubled), so user input can never inject
  * tsquery operators; the assembled string is then BOUND as a parameter to
  * `to_tsquery($cfg::regconfig, $qtext)` — no hand-rolled SQL escaping surface.
+ *
+ * Quoting prevents operator injection, NOT re-tokenization: `to_tsquery` re-parses
+ * inside the quotes, so a compound lexeme becomes an adjacency phrase with the
+ * suffix applied to every fragment (`'pump_carb':*` → `'pump':* <-> 'carb':*`).
+ * Round-trips stay consistent because the generated tsvector column re-parses the
+ * same way at write time — semantics pinned by tests/parity-compound.test.ts.
  */
 
 /** Quote one lexeme for use inside a tsquery string. */
