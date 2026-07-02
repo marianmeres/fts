@@ -1,36 +1,38 @@
 {
-	"name": "@marianmeres/fts",
-	"version": "0.1.0",
-	"exports": "./src/mod.ts",
-	"publish": {
-		"exclude": ["example/"]
-	},
-	"tasks": {
-		"example": "deno run -A --env-file example/server.ts",
-		"test": "deno test -A --env-file",
-		"test:watch": "deno test -A --env-file --watch",
-		"npm:build": "deno run -A scripts/build-npm.ts",
-		"npm:publish": "deno run -A scripts/build-npm.ts && cd ./.npm-dist && npm publish --access=public",
-		"release": "deno run -A jsr:@marianmeres/deno-release",
-		"publish": "deno publish && deno task npm:publish",
-		"rp": "deno task release -y && deno task publish",
-		"rpm": "deno task release minor -y && deno task publish"
-	},
-	"imports": {
-		"@marianmeres/clog": "jsr:@marianmeres/clog@^3.21.0",
-		"@marianmeres/demino": "jsr:@marianmeres/demino@^1.16.0",
-		"@marianmeres/npmbuild": "jsr:@marianmeres/npmbuild@^1",
-		"@marianmeres/searchable": "jsr:@marianmeres/searchable@^2.8.0",
-		"@std/assert": "jsr:@std/assert@^1",
-		"@std/fs": "jsr:@std/fs@^1",
-		"@std/path": "jsr:@std/path@^1",
-		"@types/pg": "npm:@types/pg@^8.20.0",
-		"pg": "npm:pg@^8.21.0"
-	},
-	"fmt": {
-		"useTabs": true,
-		"lineWidth": 90,
-		"indentWidth": 4,
-		"proseWrap": "preserve"
-	}
+  "name": "@marianmeres/fts",
+  "version": "1.0.0",
+  "exports": "./src/mod.ts",
+  "publish": {
+    "exclude": [
+      "example/"
+    ]
+  },
+  "tasks": {
+    "example": "deno run -A --env-file example/server.ts",
+    "test": "deno test -A --env-file",
+    "test:watch": "deno test -A --env-file --watch",
+    "npm:build": "deno run -A scripts/build-npm.ts",
+    "npm:publish": "deno run -A scripts/build-npm.ts && cd ./.npm-dist && npm publish --access=public",
+    "release": "deno run -A jsr:@marianmeres/deno-release",
+    "publish": "deno publish && deno task npm:publish",
+    "rp": "deno task release -y && deno task publish",
+    "rpm": "deno task release minor -y && deno task publish"
+  },
+  "imports": {
+    "@marianmeres/clog": "jsr:@marianmeres/clog@^3.21.0",
+    "@marianmeres/demino": "jsr:@marianmeres/demino@^1.16.0",
+    "@marianmeres/npmbuild": "jsr:@marianmeres/npmbuild@^1",
+    "@marianmeres/searchable": "jsr:@marianmeres/searchable@^2.8.0",
+    "@std/assert": "jsr:@std/assert@^1",
+    "@std/fs": "jsr:@std/fs@^1",
+    "@std/path": "jsr:@std/path@^1",
+    "@types/pg": "npm:@types/pg@^8.20.0",
+    "pg": "npm:pg@^8.21.0"
+  },
+  "fmt": {
+    "useTabs": true,
+    "lineWidth": 90,
+    "indentWidth": 4,
+    "proseWrap": "preserve"
+  }
 }
