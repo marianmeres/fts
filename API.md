@@ -22,6 +22,13 @@ Complete API reference for `@marianmeres/fts`.
 - [Types](#types)
 - [Constants](#constants)
 - [Behavior notes](#behavior-notes)
+  - [Normalization parity](#normalization-parity-the-core-invariant)
+  - [tsvector byte cap](#tsvector-byte-cap-1mb)
+  - [Query budgets](#query-budgets)
+  - [Transactions and `pg.Client`](#transactions-and-pgclient)
+  - [Performance shape](#performance-shape)
+  - [Hierarchical scopes](#hierarchical-scopes-the-dotted-convention)
+  - [Changing `fields` / `languages` later](#changing-fields--languages-later-schema-drift)
 
 ---
 
@@ -35,7 +42,7 @@ Creates an [`Fts`](#fts) store. Call [`initialize()`](#initialize) once before u
 
 | Option              | Type                                       | Default                             | Description                                                                                                                                                                                              |
 | ------------------- | ------------------------------------------ | ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `db`                | `pg.Pool \| pg.Client`                     | — (required)                        | PostgreSQL connection.                                                                                                                                                                                   |
+| `db`                | `pg.Pool \| pg.Client`                     | — (required)                        | PostgreSQL connection. A `pg.Client` may have a transaction open — the store joins it and never commits or rolls it back (see [Transactions and `pg.Client`](#transactions-and-pgclient)).               |
 | `tableName`         | `string`                                   | `"__fts"`                           | Table name; may carry one `schema.` prefix (e.g. `"public.__fts"`). Word characters only.                                                                                                                |
 | `logger`            | `Logger`                                   | `createClog("fts")`                 | [@marianmeres/clog](https://github.com/marianmeres/clog)-compatible logger.                                                                                                                              |
 | `fields`            | `Record<string, "A"\|"B"\|"C"\|"D">`       | `{ title:"A", body:"B", tags:"C" }` | Field → rank-weight map. **Baked into the generated-column DDL at `initialize()`** — changing it later is a schema change. Only listed fields are indexed.                                               |
@@ -46,6 +53,9 @@ Creates an [`Fts`](#fts) store. Call [`initialize()`](#initialize) once before u
 | `maxIndexedChars`   | `number`                                   | `1_000_000`                         | Coarse per-document character budget for indexed text.                                                                                                                                                   |
 | `maxIndexedLexemes` | `number`                                   | `10_000`                            | Per-field cap on distinct indexed tokens — the actual driver of tsvector byte size.                                                                                                                      |
 | `onOversize`        | `"truncate" \| "throw"`                    | `"truncate"`                        | Behavior when a document still overflows PostgreSQL's ~1MB tsvector byte cap (see [Behavior notes](#behavior-notes)).                                                                                    |
+| `maxQueryLexemes`   | `number`                                   | `32`                                | Cap on the query terms one `search()` uses; terms beyond it are dropped (see [Query budgets](#query-budgets)). `Infinity` disables.                                                                      |
+| `maxQueryChars`     | `number`                                   | `512`                               | Cap on the total characters of the normalized query terms one `search()` uses. `Infinity` disables.                                                                                                      |
+| `verifySchema`      | `boolean`                                  | `true`                              | In `initialize()`, refuse an existing table that was created for a different `fields`/`languages`/`fuzzy` (see [schema drift](#changing-fields--languages-later-schema-drift)).                          |
 | `searchable`        | `Searchable \| Partial<SearchableOptions>` | `new Searchable()`                  | The normalization brain ([@marianmeres/searchable](https://github.com/marianmeres/searchable)); used identically at write and query time.                                                                |
 
 **Returns:** `Fts`
@@ -89,6 +99,12 @@ and — when `fuzzy` — a generated `fts_trgm` text column with a composite
 
 Throws a descriptive error when `manageExtensions` is on and the role cannot create a
 missing extension (remedy: superuser installs it once, then `manageExtensions: false`).
+
+Since 1.2.0 it also throws when the table **already exists but was created for a
+different configuration** — a `schema drift` error naming each offending column — where
+earlier versions provisioned "successfully" and then silently searched the old
+definition. See [Changing `fields` / `languages` later](#changing-fields--languages-later-schema-drift);
+`verifySchema: false` opts out.
 
 ### `destroy(hard?)`
 
@@ -137,6 +153,12 @@ keys within `entries` are deduplicated last-wins. If one oversized entry trips t
 tsvector byte cap, the batch falls back to per-row writes (each with truncate-retry)
 inside a single transaction — one bad entry can never silently drop the batch.
 
+There is no batch-size limit: the rows travel as one array per column, so a call is
+one statement at any size. (Up to 1.1.0 a batch above 10,922 entries failed with a
+cryptic `bind message has … parameter formats but 0 parameters` — the wire protocol's
+65,535 bind-parameter cap, at six parameters per row.) Memory is the practical bound;
+chunk very large imports to keep individual statements and transactions short.
+
 **Parameters:** `entries` ([`SetEntry[]`](#types) — `FtsDoc` + `key`)
 
 **Returns:** `Promise<void>`
@@ -184,16 +206,16 @@ several scopes at once when `scope` is an array.
 
 **Options** (`SearchOptions`):
 
-| Option          | Type                               | Default                | Description                                                                     |
-| --------------- | ---------------------------------- | ---------------------- | ------------------------------------------------------------------------------- |
-| `lang`          | `string`                           | store `defaultLang`    | Whitelisted language key — selects the `tsv_<lang>` column.                     |
-| `mode`          | `"prefix" \| "exact" \| "fuzzy"`   | `"prefix"`             | See modes below.                                                                |
-| `limit`         | `number`                           | `20`                   | Page size.                                                                      |
-| `offset`        | `number`                           | `0`                    | Page offset.                                                                    |
-| `withTotal`     | `boolean`                          | `false`                | Also compute the total match count (extra `COUNT(*)`).                          |
-| `rankFn`        | `"ts_rank" \| "ts_rank_cd"`        | `"ts_rank_cd"`         | Ranking function (`_cd` = cover-density, proximity-aware).                      |
-| `weights`       | `[number, number, number, number]` | `[0.1, 0.2, 0.4, 1.0]` | Rank weights in PostgreSQL's **`{D, C, B, A}`** order.                          |
-| `trgmThreshold` | `number`                           | `0.6`                  | Fuzzy only: `pg_trgm` word-similarity threshold in `(0, 1]`, applied per query. |
+| Option          | Type                               | Default                | Description                                                                                                                    |
+| --------------- | ---------------------------------- | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| `lang`          | `string`                           | store `defaultLang`    | Whitelisted language key. `prefix`/`exact`: selects the `tsv_<lang>` column. `fuzzy`: optional narrowing — see the mode below. |
+| `mode`          | `"prefix" \| "exact" \| "fuzzy"`   | `"prefix"`             | See modes below.                                                                                                               |
+| `limit`         | `number`                           | `20`                   | Page size. Floored and clamped to `[0, Number.MAX_SAFE_INTEGER]` (`Infinity` = no limit); `NaN` throws.                        |
+| `offset`        | `number`                           | `0`                    | Page offset. Same clamping as `limit`.                                                                                         |
+| `withTotal`     | `boolean`                          | `false`                | Also compute the total match count (extra `COUNT(*)`).                                                                         |
+| `rankFn`        | `"ts_rank" \| "ts_rank_cd"`        | `"ts_rank_cd"`         | Ranking function (`_cd` = cover-density, proximity-aware).                                                                     |
+| `weights`       | `[number, number, number, number]` | `[0.1, 0.2, 0.4, 1.0]` | Rank weights in PostgreSQL's **`{D, C, B, A}`** order.                                                                         |
+| `trgmThreshold` | `number`                           | `0.6`                  | Fuzzy only: `pg_trgm` word-similarity threshold in `(0, 1]`, applied per query.                                                |
 
 **Modes:**
 
@@ -207,7 +229,10 @@ several scopes at once when `scope` is an array.
   (`runs` matches stored `running` on an `english` column).
 - **`fuzzy`** — `pg_trgm` **word-similarity** (`query <% document`): typo-tolerant and
   substring-capable; a short query matches a long document. Requires the store's
-  `fuzzy` option. Never the default.
+  `fuzzy` option. Never the default. Trigrams carry no language, so on a
+  multi-language store fuzzy matches rows of **every** language unless `lang` is
+  given — then it is narrowed to rows written with that language. (Up to 1.1.0 an
+  explicit `lang` was silently ignored in this mode, and not validated.)
 
 **Returns:** `Promise<SearchResult>`:
 
@@ -224,7 +249,8 @@ Order: `rank DESC, updated_at DESC, scope ASC, key ASC` (deterministic tiebreak 
 `key` is only unique per scope, so `scope` keeps multi-scope pagination stable).
 
 A query that normalizes to zero lexemes (empty, whitespace-only, all-stopwords)
-returns an empty result — never a full-scope dump, never an error.
+returns an empty result — never a full-scope dump, never an error. A query larger than
+the store's [query budgets](#query-budgets) is searched on its leading terms only.
 
 **Example:**
 
@@ -369,6 +395,98 @@ driven by **distinct-lexeme count**, not character count. Protection is layered:
 `onOversize: "truncate"` (default) halves the budgets and retries until it fits, while
 `"throw"` surfaces a clear error. Truncations are logged via `logger.warn`.
 
+### Query budgets
+
+A search costs more the longer its query is — and without a bound, far more than a
+search box should be able to ask for. Measured on PostgreSQL 18 over a 5,000-row
+scope: a 500-term query took 91 ms in `prefix` mode and 5.4 s in `fuzzy` mode; a
+20,000-term `prefix` query failed outright with `stack depth limit exceeded`
+(SQLSTATE 54001), and the same query in `fuzzy` mode held a connection for 109 s. One
+pasted document is enough.
+
+So the query side has the same pair of budgets as the write side, applied after
+normalization, in every mode:
+
+- `maxQueryLexemes` (default `32`) — the number of query terms used. A term is one
+  normalized query word; the alternates a `normalizeWord` expansion adds count as the
+  same term.
+- `maxQueryChars` (default `512`) — the total characters of those terms. This is what
+  bounds `fuzzy`, whose per-candidate cost grows with query length however few terms
+  there are.
+
+Terms are kept in order while both budgets hold. The first term that does not fit ends
+the query — it and everything after it are dropped (never cut in half), and the search
+runs on what was kept; nothing fits → empty result. Clamping is logged via
+`logger.debug`. Since terms are AND-ed, dropping some can only _widen_ the match set:
+an oversized query degrades to a search on its leading terms, never to an error. Raise
+a budget for a domain with genuinely long queries; `Infinity` removes it.
+
+The budgets bound what reaches PostgreSQL. Bounding the size of the raw request (and
+`limit`) remains the caller's job.
+
+### Transactions and `pg.Client`
+
+`db` may be a `pg.Pool` or a `pg.Client` (including a client checked out of a pool),
+and the two are treated differently on purpose:
+
+- A **`pg.Pool`** hands out private connections. Most operations are a single
+  autocommitted statement; the few multi-statement units (`initialize()`, a fuzzy
+  search, the `setMany` per-row fallback) run in their own short transaction on a
+  checked-out connection.
+- A **`pg.Client`** is one connection that _you_ own — and passing one is how you make
+  the store's writes part of your own transaction:
+
+  ```typescript
+  const client = await pool.connect();
+  const fts = createFts({ db: client });
+  await fts.initialize();
+  try {
+  	await client.query("BEGIN");
+  	await client.query("INSERT INTO articles ...");
+  	await fts.set(tenant, "articles", id, { fields }); // same transaction
+  	await client.query("COMMIT"); // both, or neither
+  } catch (e) {
+  	await client.query("ROLLBACK");
+  	throw e;
+  } finally {
+  	client.release();
+  }
+  ```
+
+The contract on a `pg.Client`: **the store never commits or rolls back a transaction
+it did not open.** Before a unit that needs transaction semantics it asks PostgreSQL
+whether a transaction block is open on the connection; if one is, it nests under
+`SAVEPOINT`s — on success the work stays pending in your transaction, on failure only
+the store's own unit is undone and your transaction stays usable. That includes the
+tsvector [truncate-retry](#tsvector-byte-cap-1mb), which has to re-run a _failed_
+statement (a failed statement otherwise aborts the whole transaction). With no
+transaction open, the store opens and commits its own, as with a pool.
+
+(Up to 1.1.0 these units issued a bare `BEGIN`/`COMMIT`. Inside an open transaction
+PostgreSQL downgrades that `BEGIN` to a warning, and the `COMMIT` then committed the
+caller's pending work — even from a fuzzy `search()`.)
+
+Things to know when using a `pg.Client`:
+
+- **A fuzzy search never opens or closes a transaction.** The trigram threshold is set
+  for the search and restored right after (transaction-locally inside your
+  transaction, session-level otherwise); nothing is touched when it already has the
+  wanted value.
+- **A statement that fails for another reason behaves as in plain SQL**: a failing
+  single-statement operation (`get`, `delete`, a `prefix`/`exact` `search`, …) inside
+  your transaction aborts it, and you roll back.
+- **It costs round trips.** The open-transaction check is two small statements. It
+  precedes `initialize()`, `destroy(true)`, `setMany()`, a fuzzy search with a
+  non-current threshold, and — with `onOversize: "truncate"` (the default) — every
+  `set()`; inside a transaction a savepoint pair is added around the write. Reads
+  other than fuzzy search are unaffected, and so is everything on a `pg.Pool`.
+  `onOversize: "throw"` skips the check for `set()` (nothing is retried). Prefer
+  `setMany()` for bulk writes inside a transaction.
+- **One connection, one thing at a time.** The store queues its own multi-statement
+  units per connection, so concurrent store calls on one client are safe. It cannot
+  order statements you issue on that client yourself: don't run your own queries on it
+  concurrently with an in-flight store call.
+
 ### Performance shape
 
 `WHERE tenant_id = $1 AND scope = ANY($2) AND tsv @@ query` is answered by a **single
@@ -378,6 +496,11 @@ selective queries). Ranking cost scales with the _match-set_ size, not the scope
 — a query matching tens of thousands of rows must rank them all before `LIMIT` applies
 (GIN stores no positions). Prefer selective queries; `LIMIT/OFFSET` pagination is not
 stable across concurrent writes to the same scope.
+
+`fuzzy` is the most expensive mode: every row sharing enough trigrams with the query
+is a candidate whose similarity must be computed against its full indexed text, so the
+cost follows the number of candidate rows times the query length (the latter is what
+[query budgets](#query-budgets) bound). Keep it opt-in and behind a selective scope.
 
 ### Hierarchical scopes (the dotted convention)
 
@@ -412,8 +535,33 @@ Two convention tips: pick one separator and keep it out of segment names, and no
 that a parent scope is _not_ implicitly included — `articles.news` rows match only
 when `"articles.news"` itself is in the list.
 
-### Changing `fields` / `languages` later
+### Changing `fields` / `languages` later (schema drift)
 
-Both are baked into generated-column DDL at `initialize()`. To change them on an
-existing table you must migrate the schema (in development, `destroy(true)` +
-`initialize()`).
+`fields`, `languages` (keys _and_ their text search configs) and `fuzzy` are baked
+into generated-column DDL when the table is created, and every DDL statement is
+`IF NOT EXISTS`. A store pointed at an existing table therefore keeps that table as it
+is — whatever its own configuration says.
+
+`initialize()` checks for exactly that: it reads the table's generated columns back
+from the catalog and compares them with what the configuration would create. A column
+the configuration **needs** that is missing or defined differently — another field
+list, order or weight, another text search config, a new language, `fuzzy: true` on a
+table without the trigram column — throws a `schema drift` error naming each one:
+
+```
+fts: table "__fts" was created for a different configuration (schema drift): column
+tsv_default indexes [simple: title:A, body:B, tags:C] but the store is configured for
+[simple: title:A, summary:B]; ...
+```
+
+Without the check the same situation is silent and looks like bad search results: a
+newly-configured field is stored but never indexed, so queries for its text just
+return nothing.
+
+Columns the configuration **no longer uses** (a removed language, the trigram column
+of a store now configured `fuzzy: false`) do not block — everything still configured
+works on such a table — and are reported once via `logger.warn`.
+
+To change these on an existing table, migrate the schema (in development,
+`destroy(true)` + `initialize()`). Pass `verifySchema: false` only for a table whose
+generated columns you have deliberately altered by hand.

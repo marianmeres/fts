@@ -45,4 +45,56 @@ export async function withStore(
 	}
 }
 
+/** Everything a `pg.Client`-mode test needs — see {@link withClientStore}. */
+export interface ClientStoreCtx {
+	/** Pool-backed store on the same table: the "other connection" view of the data. */
+	fts: Fts;
+	/** Store bound to ONE caller-owned connection (`client`). */
+	clientFts: Fts;
+	/** That connection — the test drives `BEGIN`/`COMMIT`/`ROLLBACK` on it itself. */
+	client: any;
+	db: any;
+}
+
+/**
+ * Like {@link withStore}, plus a second store bound to a single checked-out connection
+ * — the way an app joins the store to its own transaction. Whatever transaction a
+ * failed test leaves open is rolled back before cleanup.
+ */
+export async function withClientStore(
+	opts: Partial<FtsOptions>,
+	fn: (ctx: ClientStoreCtx) => Promise<void>,
+): Promise<void> {
+	await withStore(opts, async (fts, db) => {
+		const client = await db.connect();
+		try {
+			const clientFts = makeFts(client, opts);
+			await clientFts.initialize();
+			await fn({ fts, clientFts, client, db });
+		} finally {
+			await client.query("ROLLBACK").catch(() => {});
+			client.release();
+		}
+	});
+}
+
+/** A logger that records `warn` messages and swallows the rest. */
+export function warnSpy(): { logger: Logger; warns: string[] } {
+	const warns: string[] = [];
+	const logger = new Proxy({}, {
+		get: (_t, level) =>
+			level === "warn" ? (m: unknown) => warns.push(String(m)) : () => {},
+	}) as unknown as Logger;
+	return { logger, warns };
+}
+
+/** ~150k distinct short tokens — well over the ~1MB tsvector byte cap (PG18-verified
+ * shape: byte size is driven by distinct-lexeme count, not char count). */
+export function oversizedText(): string {
+	return Array.from({ length: 150_000 }, (_, i) => `t${i}`).join(" ");
+}
+
+/** Budgets loose enough that only the database's own byte cap stops a document. */
+export const HUGE_BUDGETS = { maxIndexedLexemes: 1_000_000, maxIndexedChars: 10_000_000 };
+
 export { createPg };

@@ -1,8 +1,14 @@
 // deno-lint-ignore-file no-explicit-any
 
-import { assert, assertEquals, assertFalse, assertThrows } from "@std/assert";
-import { createFts, type FtsOptions } from "../src/mod.ts";
-import { createPg, freshStore } from "./_fts.ts";
+import {
+	assert,
+	assertEquals,
+	assertFalse,
+	assertRejects,
+	assertThrows,
+} from "@std/assert";
+import { createFts, DEFAULT_TENANT_ID, type FtsOptions } from "../src/mod.ts";
+import { createPg, freshStore, makeFts, warnSpy } from "./_fts.ts";
 
 /** Run `fn` against a freshly-provisioned store, always cleaning up. */
 async function withStore(
@@ -264,4 +270,152 @@ Deno.test("manageExtensions:false initializes without touching extensions", asyn
 			assert((await columns(db, "fts_noext")).includes("tsv_default"));
 		},
 	);
+});
+
+// ---------------------------------------------------------------------------
+// Schema drift (real Postgres)
+//
+// `fields` / `languages` / `fuzzy` are baked into generated columns and all DDL is
+// `IF NOT EXISTS`. A store configured differently from the table it finds used to
+// initialize "successfully" and then silently search the old definition.
+// ---------------------------------------------------------------------------
+
+/** Assert that a store configured with `opts` refuses the existing table `tableName`. */
+async function assertDrift(
+	db: any,
+	tableName: string,
+	opts: Partial<FtsOptions>,
+	...expected: string[]
+): Promise<void> {
+	const drifted = makeFts(db, { tableName, ...opts });
+	const err = await assertRejects(() => drifted.initialize(), Error, "schema drift");
+	for (const part of expected) {
+		assert(err.message.includes(part), `expected "${part}" in: ${err.message}`);
+	}
+	assertFalse(drifted.initialized);
+}
+
+Deno.test("schema drift: a table created for other fields is refused", async () => {
+	await withStore({ tableName: "fts_drift1" }, async (_fts, db) => {
+		// the silent failure this guards: `summary` would never be indexed
+		await assertDrift(
+			db,
+			"fts_drift1",
+			{ fields: { title: "A", summary: "B" } },
+			"tsv_default",
+			"simple: title:A, body:B, tags:C",
+			"simple: title:A, summary:B",
+			"fts_trgm covers [title, body, tags]",
+		);
+		// same fields, another weight
+		await assertDrift(
+			db,
+			"fts_drift1",
+			{ fields: { title: "B", body: "B", tags: "C" } },
+			"tsv_default",
+			"title:B",
+		);
+		// same fields, another order — the trigram text (and so fuzzy rank) differs
+		await assertDrift(
+			db,
+			"fts_drift1",
+			{ fields: { body: "B", title: "A", tags: "C" } },
+			"fts_trgm",
+		);
+	});
+});
+
+Deno.test("schema drift: changed languages / text search config are refused", async () => {
+	await withStore({ tableName: "fts_drift2" }, async (_fts, db) => {
+		// a new language: named, instead of a bare "column tsv_sk does not exist"
+		await assertDrift(
+			db,
+			"fts_drift2",
+			{ languages: { default: "simple", sk: "simple" } },
+			'column tsv_sk is missing (language "sk")',
+		);
+		// the same language key on another config
+		await assertDrift(
+			db,
+			"fts_drift2",
+			{ languages: { default: "english" } },
+			"tsv_default",
+			"english: title:A",
+		);
+	});
+});
+
+Deno.test("schema drift: fuzzy:true needs the trigram column", async () => {
+	await withStore({ tableName: "fts_drift3", fuzzy: false }, async (_fts, db) => {
+		await assertDrift(
+			db,
+			"fts_drift3",
+			{ fuzzy: true },
+			"column fts_trgm is missing",
+		);
+	});
+});
+
+Deno.test("schema drift: columns the config no longer uses only warn", async () => {
+	await withStore(
+		{
+			tableName: "fts_drift4",
+			languages: { en: "english", sk: "simple" },
+			defaultLang: "sk",
+		},
+		async (fts, db) => {
+			await fts.set(DEFAULT_TENANT_ID, "s", "k", { fields: { title: "domov" } });
+
+			// one language dropped, fuzzy switched off: everything still configured
+			// works on this table, so it is usable — but not silently
+			const { logger, warns } = warnSpy();
+			const subset = createFts({
+				db,
+				logger,
+				tableName: "fts_drift4",
+				languages: { sk: "simple" },
+				fuzzy: false,
+			});
+			await subset.initialize();
+			assertEquals(
+				(await subset.search(DEFAULT_TENANT_ID, "s", "domov")).hits.length,
+				1,
+			);
+			assertEquals(warns.length, 1);
+			assert(warns[0].includes("fts_trgm, tsv_en"), warns[0]);
+		},
+	);
+});
+
+Deno.test("schema drift: a matching table passes (also schema-qualified, folded case)", async () => {
+	const opts = {
+		tableName: "public.fts_drift5",
+		// PostgreSQL folds these: column `tsv_en`, config `english`
+		languages: { EN: "English", sk: "simple" },
+		fields: { title: "A" as const, Body_2: "D" as const },
+	};
+	await withStore(opts, async (_fts, db) => {
+		const { logger, warns } = warnSpy();
+		const again = createFts({ db, logger, ...opts });
+		await again.initialize();
+		assert(again.initialized);
+		assertEquals(warns, []);
+
+		await assertDrift(db, "public.fts_drift5", {
+			...opts,
+			fields: { title: "A", Body_2: "C" },
+		}, "Body_2:C");
+	});
+});
+
+Deno.test("schema drift: verifySchema:false skips the check", async () => {
+	await withStore({ tableName: "fts_drift6" }, async (_fts, db) => {
+		const unchecked = makeFts(db, {
+			tableName: "fts_drift6",
+			fields: { title: "A", summary: "B" },
+			verifySchema: false,
+		});
+		await unchecked.initialize(); // the caller has taken responsibility
+		assert(unchecked.initialized);
+	});
 });

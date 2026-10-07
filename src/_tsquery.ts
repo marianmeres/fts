@@ -7,8 +7,9 @@
  * `[["big"], ["colour","color"], ["test"]]` (prefix) becomes
  * `'big':* & ('colour':* | 'color':*) & 'test':*`.
  *
- * Every lexeme is single-quoted (with `'` doubled), so user input can never inject
- * tsquery operators; the assembled string is then BOUND as a parameter to
+ * Every lexeme is single-quoted (with `'` and `\` doubled — both are special inside
+ * a quoted tsquery lexeme), so user input can never inject tsquery operators or break
+ * the quoting; the assembled string is then BOUND as a parameter to
  * `to_tsquery($cfg::regconfig, $qtext)` — no hand-rolled SQL escaping surface.
  *
  * Quoting prevents operator injection, NOT re-tokenization: `to_tsquery` re-parses
@@ -18,9 +19,13 @@
  * same way at write time — semantics pinned by tests/parity-compound.test.ts.
  */
 
-/** Quote one lexeme for use inside a tsquery string. */
+/**
+ * Quote one lexeme for use inside a tsquery string. A backslash escapes the next
+ * character there, so an undoubled trailing one would swallow the closing quote
+ * (`'foo\'` is a tsquery syntax error) — reachable once `\` is whitelisted.
+ */
 function quoteLexeme(word: string, suffix: string): string {
-	return `'${word.replaceAll("'", "''")}'${suffix}`;
+	return `'${word.replaceAll("\\", "\\\\").replaceAll("'", "''")}'${suffix}`;
 }
 
 /**

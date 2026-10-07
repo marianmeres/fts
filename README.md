@@ -86,6 +86,28 @@ const fts = createFts({
 > support `exact` mode — PostgreSQL stems before the prefix is applied, so
 > partial-word prefixes would silently miss. See [API.md](API.md) for details.
 
+## Inside your own transaction
+
+Pass a `pg.Client` (for example one checked out of your pool) instead of a `Pool` and
+the store's writes become part of your transaction — indexed together with the record
+they describe, or not at all:
+
+```typescript
+const client = await db.connect();
+const fts = createFts({ db: client });
+await fts.initialize();
+
+await client.query("BEGIN");
+await client.query("INSERT INTO articles (id, title) VALUES ($1, $2)", [id, title]);
+await fts.set("_default", "articles", id, { fields: { title } });
+await client.query("COMMIT"); // both, or neither
+```
+
+The store never commits or rolls back a transaction it did not open: inside yours it
+nests under savepoints. See
+[Transactions and `pg.Client`](API.md#transactions-and-pgclient) for the details and
+the cost.
+
 ## Hierarchical scopes ("wildcard" lookups)
 
 `scope` is opaque text matched literally — the store imposes no structure on it. To

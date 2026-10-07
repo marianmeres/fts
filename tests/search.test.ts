@@ -1,5 +1,5 @@
-import { assert, assertEquals, assertRejects } from "@std/assert";
-import { DEFAULT_TENANT_ID } from "../src/mod.ts";
+import { assert, assertEquals, assertRejects, assertThrows } from "@std/assert";
+import { createFts, DEFAULT_TENANT_ID } from "../src/mod.ts";
 import { withStore } from "./_fts.ts";
 
 const T = DEFAULT_TENANT_ID;
@@ -197,7 +197,130 @@ Deno.test("rankFn ts_rank is accepted; invalid knobs throw", async () => {
 			Error,
 			"weights",
 		);
+		// NaN is not a count: named here, not surfaced as a raw PostgreSQL 22P02
+		for (const mode of ["prefix", "fuzzy"] as const) {
+			await assertRejects(
+				() => fts.search(T, "s", "hello", { mode, limit: NaN }),
+				Error,
+				"limit must be a number",
+			);
+			await assertRejects(
+				() => fts.search(T, "s", "hello", { mode, offset: NaN }),
+				Error,
+				"offset must be a number",
+			);
+			// out-of-range values are clamped to what a bigint can hold, like negative
+			// and fractional ones always were: Infinity = "no limit" / "past the end"
+			const all = await fts.search(T, "s", "hello", { mode, limit: Infinity });
+			assertEquals(all.hits.length, 1);
+			assertEquals(all.limit, Number.MAX_SAFE_INTEGER);
+			assertEquals(
+				(await fts.search(T, "s", "hello", { mode, offset: Infinity })).hits,
+				[],
+			);
+			assertEquals(
+				(await fts.search(T, "s", "hello", { mode, limit: 1.9, offset: -3 })).hits
+					.length,
+				1,
+			);
+		}
 	});
+});
+
+Deno.test("query budgets: an oversized query degrades to its leading terms", async () => {
+	await withStore({ tableName: "fts_s13" }, async (fts) => {
+		await fts.set(T, "s", "k", { fields: { title: "red apple pie" } });
+
+		// 20k terms: unbounded, the prefix tsquery exceeded PostgreSQL's stack depth
+		// (SQLSTATE 54001) and the fuzzy statement ran for minutes
+		const head = "red apple";
+		const huge = head + " " +
+			Array.from({ length: 20_000 }, (_, i) => `w${i}`).join(" ");
+		for (const mode of ["prefix", "exact", "fuzzy"] as const) {
+			// default cap is 32 terms → still an AND that includes w0…, so no hit;
+			// the point is that it answers, and promptly
+			const started = performance.now();
+			assertEquals((await fts.search(T, "s", huge, { mode })).hits, []);
+			assert(performance.now() - started < 5_000, `${mode} took too long`);
+		}
+	});
+
+	// terms beyond the cap are dropped, not rejected
+	await withStore({ tableName: "fts_s14", maxQueryLexemes: 2 }, async (fts) => {
+		await fts.set(T, "s", "k", { fields: { title: "red apple pie" } });
+		for (const mode of ["prefix", "exact"] as const) {
+			// "zzz" alone would defeat the AND
+			assertEquals(
+				(await fts.search(T, "s", "red apple zzz", { mode })).hits.length,
+				1,
+			);
+			assertEquals((await fts.search(T, "s", "red zzz apple", { mode })).hits, []);
+		}
+		// fuzzy: "zzzzzzzz" would drag the similarity under a strict threshold
+		assertEquals(
+			(await fts.search(T, "s", "red apple zzzzzzzz", {
+				mode: "fuzzy",
+				trgmThreshold: 0.95,
+			})).hits.length,
+			1,
+		);
+	});
+});
+
+Deno.test("query budgets: maxQueryChars ends the query at the term that does not fit", async () => {
+	await withStore({ tableName: "fts_s15", maxQueryChars: 10 }, async (fts) => {
+		await fts.set(T, "s", "k", { fields: { title: "red apple pie" } });
+		const long = "a".repeat(50);
+
+		// "red" fits; the 50-char term does not → it and everything after are dropped
+		assertEquals((await fts.search(T, "s", `red ${long} zzz`)).hits.length, 1);
+		// nothing fits → zero terms → empty result (never an error, never a dump)
+		for (const mode of ["prefix", "exact", "fuzzy"] as const) {
+			assertEquals(
+				await fts.search(T, "s", `${long} red`, { mode, withTotal: true }),
+				{ hits: [], total: 0, limit: 20, offset: 0 },
+			);
+		}
+	});
+});
+
+Deno.test("query budgets: validated; Infinity disables", () => {
+	// deno-lint-ignore no-explicit-any
+	const db = {} as any;
+	for (const bad of [0, -1, NaN]) {
+		assertThrows(
+			() => createFts({ db, maxQueryLexemes: bad }),
+			Error,
+			"maxQueryLexemes",
+		);
+		assertThrows(() => createFts({ db, maxQueryChars: bad }), Error, "maxQueryChars");
+	}
+	const fts = createFts({ db, maxQueryLexemes: Infinity, maxQueryChars: Infinity });
+	assertEquals(fts.config.maxQueryLexemes, Infinity);
+	assertEquals(createFts({ db }).config.maxQueryLexemes, 32);
+	assertEquals(createFts({ db }).config.maxQueryChars, 512);
+});
+
+Deno.test("backslash in a lexeme cannot break the tsquery quoting", async () => {
+	// only reachable with `\\` whitelisted — then a term can END in a backslash, which
+	// inside a quoted tsquery lexeme escaped the closing quote (a syntax error)
+	await withStore(
+		{ tableName: "fts_s16", searchable: { nonWordCharWhitelist: "@-\\" } },
+		async (fts) => {
+			await fts.set(T, "s", "k", { fields: { title: "see path\\to file" } });
+			for (const mode of ["prefix", "exact"] as const) {
+				assertEquals(
+					(await fts.search(T, "s", "file\\", { mode })).hits.length,
+					1,
+				);
+				assertEquals(
+					(await fts.search(T, "s", "path\\to", { mode })).hits.length,
+					1,
+				);
+				assertEquals((await fts.search(T, "s", "\\", { mode })).hits, []);
+			}
+		},
+	);
 });
 
 Deno.test("hits carry the stored value", async () => {

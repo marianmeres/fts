@@ -27,10 +27,24 @@ import {
 	assertValidTableName,
 	buildDropSql,
 	buildExtensionsSql,
-	buildSchemaSql,
+	buildIndexesSql,
+	buildTableSql,
+	diffSchema,
+	GENERATED_COLUMNS_SQL,
 } from "./_schema.ts";
-import { type PgExecutor, withTx } from "./_pg.ts";
-import { isTsvectorOversize, normalizeDoc, resolveSearchable } from "./_normalize.ts";
+import {
+	type PgExecutor,
+	withLocalSetting,
+	withSavepoint,
+	withTx,
+	withTxState,
+} from "./_pg.ts";
+import {
+	clampQueryGroups,
+	isTsvectorOversize,
+	normalizeDoc,
+	resolveSearchable,
+} from "./_normalize.ts";
 import { buildTsquery } from "./_tsquery.ts";
 
 /** `ts_rank*` weights in PostgreSQL's `{D, C, B, A}` order. */
@@ -75,6 +89,22 @@ function resolveConfig(options: FtsOptions): ResolvedFtsConfig {
 		);
 	}
 
+	const maxQueryLexemes = options.maxQueryLexemes ?? 32;
+	const maxQueryChars = options.maxQueryChars ?? 512;
+	for (
+		const [what, n] of [
+			["maxQueryLexemes", maxQueryLexemes],
+			["maxQueryChars", maxQueryChars],
+		] as const
+	) {
+		// `>= 1` also rejects NaN; Infinity is the documented way to disable a cap
+		if (typeof n !== "number" || !(n >= 1)) {
+			throw new Error(
+				`fts: ${what} must be a number >= 1 (or Infinity to disable).`,
+			);
+		}
+	}
+
 	return Object.freeze({
 		tableName,
 		fields: Object.freeze({ ...fields }),
@@ -85,6 +115,9 @@ function resolveConfig(options: FtsOptions): ResolvedFtsConfig {
 		maxIndexedChars: options.maxIndexedChars ?? 1_000_000,
 		maxIndexedLexemes: options.maxIndexedLexemes ?? 10_000,
 		onOversize: options.onOversize ?? "truncate",
+		maxQueryLexemes,
+		maxQueryChars,
+		verifySchema: options.verifySchema ?? true,
 	});
 }
 
@@ -123,13 +156,22 @@ export class Fts {
 	/**
 	 * Create the table, generated columns and indexes (idempotent, `IF NOT EXISTS`).
 	 * When `manageExtensions` is on, also creates `btree_gin` (+ `pg_trgm` when `fuzzy`).
+	 *
+	 * Because the DDL is `IF NOT EXISTS`, a table that already exists is kept as it is —
+	 * so unless `verifySchema` is off, its generated columns are compared with this
+	 * store's `fields`/`languages`/`fuzzy` and a mismatch throws instead of silently
+	 * searching the old definition.
 	 */
 	async initialize(): Promise<void> {
 		if (this.#initialized) return;
-		if (this.config.manageExtensions) {
-			await this.#createExtensions();
-		}
-		await withTx(this.#db, (c) => c.query(buildSchemaSql(this.config)));
+		await withTx(this.#db, async (c) => {
+			if (this.config.manageExtensions) await this.#createExtensions(c);
+			await c.query(buildTableSql(this.config));
+			// between table and indexes: on a drifted table the index DDL would fail
+			// first, with a bare "column does not exist"
+			if (this.config.verifySchema) await this.#verifySchema(c);
+			await c.query(buildIndexesSql(this.config));
+		});
 		this.#initialized = true;
 		this.#logger?.debug?.(`fts: initialized table "${this.config.tableName}"`);
 	}
@@ -156,14 +198,31 @@ export class Fts {
 		this.#assertStr(tenantId, "tenantId");
 		this.#assertStr(scope, "scope");
 		this.#assertStr(key, "key");
-		await this.#setOn(this.#db as unknown as PgExecutor, tenantId, scope, key, doc);
+		if (this.config.onOversize !== "truncate") {
+			// nothing is retried, so there is no need to know about an outer transaction
+			await this.#setOn(
+				this.#db as unknown as PgExecutor,
+				tenantId,
+				scope,
+				key,
+				doc,
+			);
+			return;
+		}
+		// truncate-retry re-runs a FAILED statement — inside a caller's transaction
+		// (`db` is a pg.Client) that is only possible under a savepoint
+		await withTxState(
+			this.#db,
+			(exec, inTx) => this.#setOn(exec, tenantId, scope, key, doc, inTx),
+		);
 	}
 
 	/**
 	 * Upsert many documents under one `(tenantId, scope)` — atomic: either all entries
-	 * land or none. Uses a single multi-row statement; on tsvector overflow it falls
-	 * back to per-row writes (with truncate-retry) inside one transaction, so a single
-	 * oversized entry can never silently drop the batch.
+	 * land or none. Uses a single statement whatever the batch size (the rows travel as
+	 * arrays, so the 65,535 bind-parameter limit of a `VALUES` list does not apply); on
+	 * tsvector overflow it falls back to per-row writes (with truncate-retry) inside one
+	 * transaction, so a single oversized entry can never silently drop the batch.
 	 */
 	async setMany(tenantId: string, scope: string, entries: SetEntry[]): Promise<void> {
 		this.#assertInitialized();
@@ -181,10 +240,10 @@ export class Fts {
 		const deduped = [...byKey.values()];
 
 		const { tableName } = this.config;
-		const placeholders: string[] = [];
-		// deno-lint-ignore no-explicit-any
-		const params: any[] = [];
-		let i = 1;
+		const keys: string[] = [];
+		const langs: string[] = [];
+		const contents: string[] = [];
+		const values: (string | undefined)[] = [];
 		for (const e of deduped) {
 			const lang = this.#resolveLang(e.lang);
 			const { content, truncated } = normalizeDoc(
@@ -193,40 +252,48 @@ export class Fts {
 				e.fields,
 			);
 			if (truncated) this.#warnTruncated(tenantId, scope, e.key);
-			placeholders.push(`($${i++}, $${i++}, $${i++}, $${i++}, $${i++}, $${i++})`);
-			params.push(
-				tenantId,
-				scope,
-				e.key,
-				lang,
-				JSON.stringify(content),
-				JSON.stringify(e.value === undefined ? e.fields : e.value),
-			);
+			keys.push(e.key);
+			langs.push(lang);
+			contents.push(JSON.stringify(content));
+			values.push(JSON.stringify(e.value === undefined ? e.fields : e.value));
 		}
 
+		// one array per column, zipped by unnest() — six parameters for any row count
 		const sql =
 			`INSERT INTO ${tableName} (tenant_id, scope, key, lang, content, value)
-			VALUES ${placeholders.join(", ")}
+			SELECT $1::text, $2::text, u.key, u.lang, u.content, u.value
+			FROM unnest($3::text[], $4::text[], $5::jsonb[], $6::jsonb[])
+				AS u(key, lang, content, value)
 			ON CONFLICT (tenant_id, scope, key) DO UPDATE SET
 				lang = EXCLUDED.lang,
 				content = EXCLUDED.content,
 				value = EXCLUDED.value,
 				updated_at = NOW()`;
+		const params = [tenantId, scope, keys, langs, contents, values];
 
-		try {
-			await this.#db.query(sql, params);
-		} catch (err) {
-			if (!isTsvectorOversize(err)) throw err;
-			// atomic per-row fallback: each row gets its own truncate-retry
-			this.#logger?.warn?.(
-				`fts: setMany batch hit the tsvector byte cap — retrying per-row`,
-			);
-			await withTx(this.#db, async (c) => {
-				for (const e of deduped) {
-					await this.#setOn(c, tenantId, scope, e.key, e, true);
-				}
-			});
-		}
+		// inside a caller's transaction the attempt runs under a savepoint, so an
+		// overflow does not abort it and the per-row fallback below can still run
+		const oversize = await withTxState(this.#db, async (exec, inTx) => {
+			const upsert = () => exec.query(sql, params);
+			try {
+				await (inTx ? withSavepoint(exec, "fts_many", upsert) : upsert());
+				return false;
+			} catch (err) {
+				if (!isTsvectorOversize(err)) throw err;
+				return true;
+			}
+		});
+		if (!oversize) return;
+
+		// atomic per-row fallback: each row gets its own truncate-retry
+		this.#logger?.warn?.(
+			`fts: setMany batch hit the tsvector byte cap — retrying per-row`,
+		);
+		await withTx(this.#db, async (c) => {
+			for (const e of deduped) {
+				await this.#setOn(c, tenantId, scope, e.key, e, true);
+			}
+		});
 	}
 
 	/** Return the stored `value` (or `null` when the row does not exist). */
@@ -317,6 +384,7 @@ export class Fts {
 	 * - `exact`: whole-word matching; works on any config (stemmed included).
 	 * - `fuzzy`: `pg_trgm` word-similarity (substring + typo tolerance); requires
 	 *   the store's `fuzzy` option; threshold via `trgmThreshold` (default 0.6).
+	 *   Language-independent: spans every language unless `lang` is given.
 	 *
 	 * Multi-scope search is the "subtree" primitive for hierarchical scope
 	 * conventions (e.g. dotted scopes): enumerate the descendant scopes app-side and
@@ -325,7 +393,8 @@ export class Fts {
 	 * matching here (a `%` or `*` in a scope is just a character).
 	 *
 	 * A query that normalizes to zero lexemes returns an empty result (never a
-	 * full-scope dump, never a `to_tsquery('')` error).
+	 * full-scope dump, never a `to_tsquery('')` error). A query beyond the store's
+	 * `maxQueryLexemes` / `maxQueryChars` is searched on its leading terms only.
 	 */
 	async search(
 		tenantId: string,
@@ -338,8 +407,8 @@ export class Fts {
 		const scopes = this.#resolveScopes(scope);
 
 		const mode = opts.mode ?? "prefix";
-		const limit = Math.max(0, Math.floor(opts.limit ?? 20));
-		const offset = Math.max(0, Math.floor(opts.offset ?? 0));
+		const limit = this.#resolveCount(opts.limit ?? 20, "limit");
+		const offset = this.#resolveCount(opts.offset ?? 0, "offset");
 		const withTotal = !!opts.withTotal;
 		const empty: SearchResult = withTotal
 			? { hits: [], total: 0, limit, offset }
@@ -354,6 +423,8 @@ export class Fts {
 				withTotal,
 				empty,
 				trgmThreshold: opts.trgmThreshold,
+				// trigrams carry no language: narrow only when the caller asks to
+				lang: opts.lang === undefined ? undefined : this.#resolveLang(opts.lang),
 			});
 		}
 		if (mode !== "prefix" && mode !== "exact") {
@@ -383,8 +454,13 @@ export class Fts {
 			throw new Error(`fts: weights must be 4 numbers in {D, C, B, A} order.`);
 		}
 
+		const { groups, clamped } = clampQueryGroups(
+			this.searchable.toQueryGroups(query),
+			this.config,
+		);
+		if (clamped) this.#debugClamped(groups.length);
 		// empty-token short-circuit — to_tsquery('') would throw
-		const qtext = buildTsquery(this.searchable.toQueryGroups(query), mode);
+		const qtext = buildTsquery(groups, mode);
 		if (!qtext) return empty;
 
 		const { tableName } = this.config;
@@ -422,8 +498,9 @@ export class Fts {
 	 * long document (whole-string `similarity()`/`%` would silently miss it).
 	 *
 	 * The `<%` operator takes no per-query threshold — the boundary is the
-	 * `pg_trgm.word_similarity_threshold` GUC — so it is set transaction-locally via
-	 * `set_config(..., true)` on a pinned connection (never leaks into the pool).
+	 * `pg_trgm.word_similarity_threshold` GUC — so it is scoped to these statements by
+	 * `withLocalSetting`: transaction-local on a pinned pool connection, set-and-restored
+	 * on a caller's `pg.Client` (never leaks, and never commits a caller's transaction).
 	 */
 	async #searchFuzzy(
 		tenantId: string,
@@ -435,6 +512,7 @@ export class Fts {
 			withTotal: boolean;
 			empty: SearchResult;
 			trgmThreshold?: number;
+			lang?: string;
 		},
 	): Promise<SearchResult> {
 		if (!this.config.fuzzy) {
@@ -448,44 +526,57 @@ export class Fts {
 		}
 
 		// same normalization brain as the write side (accent/case folding parity)
-		const qNorm = this.searchable.toWords(query, true).join(" ");
+		const { groups, clamped } = clampQueryGroups(
+			this.searchable.toWords(query, true).map((w) => [w]),
+			this.config,
+		);
+		if (clamped) this.#debugClamped(groups.length);
+		const qNorm = groups.flat().join(" ");
 		if (!qNorm) return o.empty;
 
 		const { tableName } = this.config;
-		return await withTx(this.#db, async (c) => {
-			await c.query(
-				`SELECT set_config('pg_trgm.word_similarity_threshold', $1::text, true)`,
-				[String(threshold)],
-			);
-			const { rows } = await c.query(
-				`SELECT key, scope, value, word_similarity($1, fts_trgm)::float8 AS rank
-				FROM ${tableName}
-				WHERE tenant_id = $2 AND scope = ANY($3) AND $1 <% fts_trgm
-				ORDER BY rank DESC, updated_at DESC, scope ASC, key ASC
-				LIMIT $4 OFFSET $5`,
-				[qNorm, tenantId, scopes, o.limit, o.offset],
-			);
-			const hits = rows.map((r) => ({
-				key: r.key as string,
-				scope: r.scope as string,
-				value: r.value as unknown,
-				rank: Number(r.rank),
-			}));
+		const params = [qNorm, tenantId, scopes];
+		let where = `tenant_id = $2 AND scope = ANY($3) AND $1 <% fts_trgm`;
+		if (o.lang !== undefined) {
+			params.push(o.lang);
+			where += ` AND lang = $${params.length}`;
+		}
+		const n = params.length;
 
-			if (!o.withTotal) return { hits, limit: o.limit, offset: o.offset };
+		return await withLocalSetting(
+			this.#db,
+			"pg_trgm.word_similarity_threshold",
+			String(threshold),
+			async (c) => {
+				const { rows } = await c.query(
+					`SELECT key, scope, value, word_similarity($1, fts_trgm)::float8 AS rank
+					FROM ${tableName}
+					WHERE ${where}
+					ORDER BY rank DESC, updated_at DESC, scope ASC, key ASC
+					LIMIT $${n + 1} OFFSET $${n + 2}`,
+					[...params, o.limit, o.offset],
+				);
+				const hits = rows.map((r) => ({
+					key: r.key as string,
+					scope: r.scope as string,
+					value: r.value as unknown,
+					rank: Number(r.rank),
+				}));
 
-			const { rows: cnt } = await c.query(
-				`SELECT COUNT(*)::int AS count FROM ${tableName}
-				WHERE tenant_id = $2 AND scope = ANY($3) AND $1 <% fts_trgm`,
-				[qNorm, tenantId, scopes],
-			);
-			return {
-				hits,
-				total: cnt[0]?.count ?? 0,
-				limit: o.limit,
-				offset: o.offset,
-			};
-		});
+				if (!o.withTotal) return { hits, limit: o.limit, offset: o.offset };
+
+				const { rows: cnt } = await c.query(
+					`SELECT COUNT(*)::int AS count FROM ${tableName} WHERE ${where}`,
+					params,
+				);
+				return {
+					hits,
+					total: cnt[0]?.count ?? 0,
+					limit: o.limit,
+					offset: o.offset,
+				};
+			},
+		);
 	}
 
 	// -----------------------------------------------------------------------
@@ -498,9 +589,10 @@ export class Fts {
 	 * overflow even under the char budget. Per `onOversize`, either halve the budgets
 	 * and retry ("truncate") or surface a clear error ("throw").
 	 *
-	 * When running inside an open transaction (`inTx`), each attempt is wrapped in a
-	 * SAVEPOINT — a failed statement aborts a plain transaction, so retrying is only
-	 * possible after `ROLLBACK TO SAVEPOINT`.
+	 * When running inside an open transaction (`inTx` — the store's own, or one the
+	 * caller holds on a `pg.Client`), each attempt is wrapped in a SAVEPOINT — a failed
+	 * statement aborts a plain transaction, so retrying is only possible after
+	 * `ROLLBACK TO SAVEPOINT`.
 	 */
 	async #setOn(
 		exec: PgExecutor,
@@ -523,9 +615,8 @@ export class Fts {
 				scale,
 			);
 			if (truncated) this.#warnTruncated(tenantId, scope, key);
-			try {
-				if (inTx) await exec.query("SAVEPOINT fts_set");
-				await exec.query(
+			const upsert = () =>
+				exec.query(
 					`INSERT INTO ${tableName} (tenant_id, scope, key, lang, content, value)
 					VALUES ($1, $2, $3, $4, $5, $6)
 					ON CONFLICT (tenant_id, scope, key) DO UPDATE SET
@@ -535,11 +626,11 @@ export class Fts {
 						updated_at = NOW()`,
 					[tenantId, scope, key, lang, JSON.stringify(content), value],
 				);
-				if (inTx) await exec.query("RELEASE SAVEPOINT fts_set");
+			try {
+				// the savepoint un-aborts the surrounding transaction on failure
+				await (inTx ? withSavepoint(exec, "fts_set", upsert) : upsert());
 				return;
 			} catch (err) {
-				// un-abort the surrounding transaction before deciding what to do next
-				if (inTx) await exec.query("ROLLBACK TO SAVEPOINT fts_set");
 				if (!isTsvectorOversize(err)) throw err;
 				if (onOversize === "throw") {
 					throw new Error(
@@ -569,6 +660,18 @@ export class Fts {
 		if (!this.#initialized) {
 			throw new Error("fts: not initialized (call `initialize()` first).");
 		}
+	}
+
+	/**
+	 * `limit` / `offset` as an integer PostgreSQL accepts as a bigint: floored and
+	 * clamped to `[0, Number.MAX_SAFE_INTEGER]` (so `Infinity` reads as "no limit").
+	 * `NaN` has no such reading and is rejected here rather than by the database.
+	 */
+	#resolveCount(value: number, what: string): number {
+		if (typeof value !== "number" || Number.isNaN(value)) {
+			throw new Error(`fts: ${what} must be a number.`);
+		}
+		return Math.min(Number.MAX_SAFE_INTEGER, Math.max(0, Math.floor(value)));
 	}
 
 	#assertStr(value: string, what: string): void {
@@ -612,9 +715,43 @@ export class Fts {
 		);
 	}
 
-	async #createExtensions(): Promise<void> {
+	#debugClamped(kept: number): void {
+		this.#logger?.debug?.(
+			`fts: query exceeded maxQueryLexemes/maxQueryChars — searching its first ` +
+				`${kept} term(s) only`,
+		);
+	}
+
+	/**
+	 * Refuse a pre-existing table created for a different `fields`/`languages`/`fuzzy`
+	 * (see `diffSchema`). Unused leftover columns are only warned about.
+	 */
+	async #verifySchema(exec: PgExecutor): Promise<void> {
+		const { tableName } = this.config;
+		const { rows } = await exec.query(GENERATED_COLUMNS_SQL, [tableName]);
+		const { errors, extras } = diffSchema(this.config, rows);
+		if (extras.length) {
+			this.#logger?.warn?.(
+				`fts: table "${tableName}" has generated column(s) this store's ` +
+					`configuration does not use: ${extras.join(", ")}`,
+			);
+		}
+		if (errors.length) {
+			throw new Error(
+				`fts: table "${tableName}" was created for a different configuration ` +
+					`(schema drift): ${
+						errors.join("; ")
+					}. \`fields\`, \`languages\` and ` +
+					`\`fuzzy\` are baked into generated columns when the table is created — ` +
+					`migrate the table (in development: destroy(true) + initialize()), or ` +
+					`pass { verifySchema: false } to skip this check.`,
+			);
+		}
+	}
+
+	async #createExtensions(exec: PgExecutor): Promise<void> {
 		try {
-			await this.#db.query(buildExtensionsSql(this.config));
+			await exec.query(buildExtensionsSql(this.config));
 		} catch (err) {
 			const needed = this.config.fuzzy ? "btree_gin, pg_trgm" : "btree_gin";
 			throw new Error(

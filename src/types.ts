@@ -37,7 +37,14 @@ export type OnOversize = "truncate" | "throw";
  * Options accepted by {@link createFts}.
  */
 export interface FtsOptions {
-	/** PostgreSQL connection — either a `pg.Pool` or a `pg.Client`. Required. */
+	/**
+	 * PostgreSQL connection — either a `pg.Pool` or a `pg.Client`. Required.
+	 *
+	 * A `pg.Client` (including one checked out of a pool) is a connection you own: pass
+	 * one to make the store's writes part of YOUR transaction. The store never commits
+	 * or rolls back a transaction it did not open — it detects an open one and nests
+	 * under savepoints. See API.md → "Transactions and `pg.Client`".
+	 */
 	db: pg.Pool | pg.Client;
 	/**
 	 * Table name. May be prefixed with a schema, e.g. `"public.__fts"`. Only word
@@ -99,6 +106,38 @@ export interface FtsOptions {
 	 */
 	onOversize?: OnOversize;
 	/**
+	 * Cap on the number of query terms a single {@link Fts.search} uses — the query-side
+	 * twin of {@link FtsOptions.maxIndexedLexemes}. A term is one normalized query word
+	 * (its `normalizeWord` alternates count as the same term). Terms beyond the cap are
+	 * dropped, so an oversized query (a pasted paragraph, a hostile request) degrades to
+	 * a search on its leading terms instead of an expensive or failing statement: query
+	 * cost grows with term count, and a tsquery of tens of thousands of terms exceeds
+	 * PostgreSQL's stack depth. Pass `Infinity` to disable.
+	 * @default 32
+	 */
+	maxQueryLexemes?: number;
+	/**
+	 * Cap on the total characters of the normalized query terms a single
+	 * {@link Fts.search} uses — the query-side twin of {@link FtsOptions.maxIndexedChars}.
+	 * Terms are kept in order while they fit; the first one that does not, and
+	 * everything after it, is dropped (never cut in half). Bounds the fuzzy path, whose
+	 * per-candidate cost grows with query length however few terms there are. Pass
+	 * `Infinity` to disable.
+	 * @default 512
+	 */
+	maxQueryChars?: number;
+	/**
+	 * Verify, during {@link Fts.initialize}, that an already-existing table was created
+	 * for THIS configuration, and throw when it was not. `fields`, `languages` and
+	 * `fuzzy` are baked into generated columns and all DDL is `IF NOT EXISTS`, so
+	 * without the check a changed config provisions "successfully" and then silently
+	 * searches the old definition (a newly-configured field is never indexed). Columns
+	 * the config no longer uses are tolerated with a warning. Set `false` only for a
+	 * table whose generated columns you have deliberately altered by hand.
+	 * @default true
+	 */
+	verifySchema?: boolean;
+	/**
 	 * The normalization brain. Either a ready `Searchable` instance or options to construct
 	 * one. The SAME instance is used at write and query time to keep lexemes in sync.
 	 *
@@ -128,6 +167,9 @@ export interface ResolvedFtsConfig {
 	maxIndexedChars: number;
 	maxIndexedLexemes: number;
 	onOversize: OnOversize;
+	maxQueryLexemes: number;
+	maxQueryChars: number;
+	verifySchema: boolean;
 }
 
 /** A fielded document written via {@link Fts.set}. */
@@ -150,7 +192,12 @@ export type SearchMode = "prefix" | "exact" | "fuzzy";
 
 /** Options for {@link Fts.search}. */
 export interface SearchOptions {
-	/** Language key (whitelisted); defaults to the store's `defaultLang`. */
+	/**
+	 * Language key (whitelisted). `prefix`/`exact` search exactly one language and
+	 * default to the store's `defaultLang`. `fuzzy` matches trigrams, which carry no
+	 * language, so it spans every language unless `lang` is given — then it is
+	 * narrowed to rows written with that language.
+	 */
 	lang?: string;
 	/** @default "prefix" */
 	mode?: SearchMode;

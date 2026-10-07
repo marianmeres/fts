@@ -14,12 +14,12 @@ No external search engine — one PG table with generated tsvector columns.
 src/mod.ts        — barrel (public surface only)
 src/fts.ts        — createFts() + Fts class: config resolution, lifecycle, CRUD, search
 src/types.ts      — public types + DEFAULT_* constants
-src/_schema.ts    — config-driven DDL builders + identifier validation (internal)
-src/_normalize.ts — searchable wiring: normalizeDoc(), budgets, oversize detection (internal)
+src/_schema.ts    — config-driven DDL builders + identifier validation + drift detection (diffSchema) (internal)
+src/_normalize.ts — searchable wiring: normalizeDoc(), write + query budgets, oversize detection (internal)
 src/_tsquery.ts   — query groups → safe tsquery string (internal)
-src/_pg.ts        — PgExecutor seam, isPool/acquireClient/withTx (internal)
+src/_pg.ts        — PgExecutor seam + THE transaction policy: isPool, inTransaction (probe), withTx, withTxState, withSavepoint, withLocalSetting (internal)
 tests/_pg.ts      — createPg() from TEST_PG_* env
-tests/_fts.ts     — makeFts/freshStore/withStore helpers, noopLogger
+tests/_fts.ts     — makeFts/freshStore/withStore/withClientStore helpers, noopLogger, warnSpy
 example/          — movie search playground (demino REST server + vanilla client); `deno task example`, see example/README.md
 tmp/              — initial spec, implementation plan, spike results (git-ignored, local only)
 ```
@@ -51,15 +51,19 @@ Indexes: `idx_<safe(tableName)>_tsv_<lang>` = `gin (tenant_id, scope, tsv_<lang>
 3. **Safe tsquery**: lexemes quoted (`'` doubled) in `_tsquery.ts`; the assembled string + config are BOUND as params. Zero-lexeme queries short-circuit to an empty result (`to_tsquery('')` throws).
 4. **Language whitelist**: `lang` is validated against configured `languages` keys before touching SQL — `tsv_<lang>` is spliced, never from raw input. Same for `tableName`/fields/configs (validated identifiers; DDL has no bind params).
 5. **`prefix` mode only on `simple` configs**: PG stems before applying `:*`, so prefix on a stemmed column silently misses — `search()` rejects that combination; `exact` works on stemmed.
-6. **tsvector ~1MB byte cap** (SQLSTATE 54000, driven by distinct-lexeme count): budgets truncate up-front; writes catch 54000 and halve-and-retry (`onOversize:"truncate"`) or throw. Inside a transaction, each retry attempt MUST be wrapped in `SAVEPOINT`/`ROLLBACK TO SAVEPOINT` (a failed statement aborts a plain tx) — see `#setOn(..., inTx)`.
-7. **Fuzzy = word-similarity**: `$q <% fts_trgm` (+ `word_similarity()` rank), never whole-string `%`/`similarity()` (short queries over long docs score ~0 and miss). The threshold is a GUC — set per-transaction via `set_config('pg_trgm.word_similarity_threshold', $1, true)` on a pinned connection (`withTx`), never session-wide on a pool.
+6. **tsvector ~1MB byte cap** (SQLSTATE 54000, driven by distinct-lexeme count): budgets truncate up-front; writes catch 54000 and halve-and-retry (`onOversize:"truncate"`) or throw. Inside a transaction — the store's own OR one the caller holds on a `pg.Client` — each retry attempt MUST be wrapped in a savepoint (a failed statement aborts a plain tx) — see `#setOn(..., inTx)` / `withSavepoint`.
+7. **Fuzzy = word-similarity**: `$q <% fts_trgm` (+ `word_similarity()` rank), never whole-string `%`/`similarity()` (short queries over long docs score ~0 and miss). The threshold is a GUC — scope it to the search with `withLocalSetting`, never a bare `set_config`: transaction-local on a pinned pool connection; on a caller's `pg.Client` read → set → restore with NO transaction opened (transaction-local if the caller has one open, else session-level). Never session-wide on a pool. Fuzzy is language-independent by schema design (`fts_trgm` has no `lang` guard): it spans languages unless the caller passes `lang` (then `AND lang = $n`, whitelisted).
 8. **kv-style pg conventions**: `db: pg.Pool | pg.Client` option; positional `$n` params; `{rows, rowCount}`; upsert = `INSERT ... ON CONFLICT ... DO UPDATE SET ..., updated_at = NOW()`; Pool detected via `totalCount`; `logger?.level?.(...)` defensive calls; tabs, lineWidth 90.
-9. `fields`/`languages` are frozen into generated-column DDL at `initialize()` — changing them is a schema change, not a config tweak.
+9. `fields`/`languages`/`fuzzy` are frozen into generated-column DDL at `initialize()` — changing them is a schema change, not a config tweak. Since all DDL is `IF NOT EXISTS`, `initialize()` ENFORCES this (`verifySchema`, default on): between `CREATE TABLE` and `CREATE INDEX` it reads the generated columns back (`pg_get_expr`) and `diffSchema` throws a `schema drift` error for any column the config needs that is missing/different; unused leftover columns only `logger.warn`. Any change to the generated-column expressions in `_schema.ts` must keep `parseTsvExpr`/`parseTrgmExpr` able to read them back (they match structure, not exact text).
 10. **Scopes are literal — never pattern-matched**: hierarchical ("dotted") scopes are a naming convention; subtree search = the caller enumerates scopes and the read paths (`search`/`count`) take `string | string[]` → `scope = ANY($n)`, which lands fully in the composite GIN Index Cond (lab-verified, PG 18). NEVER emit `scope LIKE`/`^@` (unindexed here — heap filter) or byte-range rewrites (`scope >= 'p.' AND scope < 'p/'` returns wrong rows under glibc `en_US.utf8`, which ignores punctuation at the primary sort level). Multi-scope ordering appends `scope ASC` before `key ASC` (`key` is only unique per scope — pagination would otherwise be unstable).
+
+11. **Never end a transaction the store did not open** (`_pg.ts` owns this): `db` may be a `pg.Client` the caller holds a transaction on. A bare `BEGIN` there is only a warning and the matching `COMMIT` commits the CALLER's work. So: `pg.Pool` → own transaction on a checked-out client; `pg.Client` → `inTransaction()` probe (a transaction-local GUC survives into the next statement only inside a transaction block — deterministic, raises nothing, two round trips), then nest under `SAVEPOINT` if open, own `BEGIN`/`COMMIT` if idle. Always go through `withTx` / `withTxState` / `withLocalSetting` — never write `BEGIN`/`COMMIT`/`ROLLBACK` in `fts.ts`. Reads never roll anything back. Client-mode units are queued per connection (`serialize`, NOT re-entrant — never call one `_pg.ts` unit from inside another on the same client). Pool hot paths must stay single-statement (`set`, `setMany`, non-fuzzy `search`): no probe, no savepoint.
+12. **Queries are budgeted like documents**: `maxQueryLexemes` (32) / `maxQueryChars` (512) clamp the normalized query in EVERY mode via `clampQueryGroups` before it reaches SQL — unbounded, a 20k-term tsquery hits SQLSTATE 54001 and fuzzy cost grows linearly with query length. Clamp = keep leading terms, drop the rest whole (AND semantics → can only widen), never throw.
+13. **`setMany` = one statement at any size**: rows travel as one array per column through `unnest(...)` (6 params total). Never build a `VALUES ($1,…),(…)` list — 6 params/row hits the wire protocol's 65,535 cap at 10,923 rows, and the 16-bit count wraps into a cryptic `08P01`.
 
 ## Testing
 
-Real PostgreSQL (no mocks). `tests/_pg.ts` reads `TEST_PG_HOST/PORT/DATABASE/USER/PASSWORD` (see `.env.example`; `deno task test` = `deno test -A --env-file`). Extensions `btree_gin` + `pg_trgm` must exist in the test DB (superuser installs once; `CREATE EXTENSION IF NOT EXISTS` then no-ops for the test role). Each test uses `withStore()` → fresh table (`destroy(true)` + `initialize()`), own `tableName`, silent logger, `db.end()` cleanup. 74 tests across `fts` (CRUD + oversize), `schema` (DDL introspection), `search`, `scope-hierarchy` (multi-scope `= ANY`, literal matching, scope tiebreak), `parity-compound` (two-tokenizer round-trips + characterized edges), `language`, `fuzzy`, `tenant` (isolation).
+Real PostgreSQL (no mocks). `tests/_pg.ts` reads `TEST_PG_HOST/PORT/DATABASE/USER/PASSWORD` (see `.env.example`; `deno task test` = `deno test -A --env-file`). Extensions `btree_gin` + `pg_trgm` must exist in the test DB (superuser installs once; `CREATE EXTENSION IF NOT EXISTS` then no-ops for the test role). Each test uses `withStore()` → fresh table (`destroy(true)` + `initialize()`), own `tableName`, silent logger, `db.end()` cleanup. 95 tests across `fts` (CRUD + oversize + large batch), `schema` (DDL introspection + drift), `search` (+ query budgets), `scope-hierarchy` (multi-scope `= ANY`, literal matching, scope tiebreak), `parity-compound` (two-tokenizer round-trips + characterized edges), `language`, `fuzzy`, `tenant` (isolation), `client-tx` (`db` as a caller-owned `pg.Client`: `withClientStore()` gives a pool-backed store plus one bound to a single checked-out connection, the test drives `BEGIN`/`COMMIT`/`ROLLBACK` itself).
 
 ## Key Exports
 
@@ -67,7 +71,7 @@ Real PostgreSQL (no mocks). `tests/_pg.ts` reads `TEST_PG_HOST/PORT/DATABASE/USE
 
 ## Before Making Changes
 
-- [ ] Read the invariants above — esp. tenant isolation (1), parity (2), and the 54000/SAVEPOINT mechanics (6).
+- [ ] Read the invariants above — esp. tenant isolation (1), parity (2), the 54000/SAVEPOINT mechanics (6), and the transaction policy (11).
 - [ ] `deno task test` against a real PG before and after.
 - [ ] `deno fmt src tests && deno lint src tests`.
 - [ ] New public surface → export from `src/mod.ts`, document in [API.md](API.md), keep README example-level only.

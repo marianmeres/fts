@@ -2,7 +2,7 @@
 
 import { assert, assertEquals, assertFalse, assertRejects } from "@std/assert";
 import { createFts, DEFAULT_TENANT_ID, Fts } from "../src/mod.ts";
-import { makeFts, withStore } from "./_fts.ts";
+import { HUGE_BUDGETS, makeFts, oversizedText, withStore } from "./_fts.ts";
 
 const T = DEFAULT_TENANT_ID;
 
@@ -104,6 +104,34 @@ Deno.test("setMany + count; duplicate keys are last-wins", async () => {
 	});
 });
 
+Deno.test("setMany: one call is one statement at any batch size", async () => {
+	await withStore({ tableName: "fts_manybig" }, async (fts) => {
+		// a VALUES list binds 6 parameters per row and the wire protocol caps a
+		// statement at 65,535 — so 10,923+ rows used to fail (and cryptically: the
+		// 16-bit count wraps). Rows now travel as six arrays, whatever their number.
+		const entries = Array.from({ length: 12_000 }, (_, i) => ({
+			key: `k${i}`,
+			fields: {
+				title: `document number ${i}`,
+				body: `it's "quoted", {braced} \\ ok`,
+			},
+			value: i === 7 ? null : { i },
+		}));
+		await fts.setMany(T, "s", entries);
+
+		assertEquals(await fts.count(T, "s"), 12_000);
+		assertEquals(await fts.get(T, "s", "k11999"), { i: 11_999 });
+		// a JSON null payload survives the array transport (it is not SQL NULL-ed away)
+		assertEquals(await fts.get(T, "s", "k7"), null);
+		assertEquals((await fts.search(T, "s", "braced", { limit: 1 })).hits.length, 1);
+
+		// still an upsert: a second pass updates in place
+		await fts.setMany(T, "s", [{ key: "k0", fields: { title: "replaced" } }]);
+		assertEquals(await fts.count(T, "s"), 12_000);
+		assertEquals(await fts.get(T, "s", "k0"), { title: "replaced" });
+	});
+});
+
 Deno.test("deleteMany returns the actually-deleted count", async () => {
 	await withStore({ tableName: "fts_delm" }, async (fts) => {
 		await fts.setMany(T, "s", [
@@ -173,13 +201,6 @@ Deno.test("maxIndexedLexemes truncates indexed text, keeps full value", async ()
 		},
 	);
 });
-
-/** ~150k distinct short tokens — well over the ~1MB tsvector byte cap (PG18-verified
- * shape: byte size is driven by distinct-lexeme count, not char count). */
-function oversizedText(): string {
-	return Array.from({ length: 150_000 }, (_, i) => `t${i}`).join(" ");
-}
-const HUGE_BUDGETS = { maxIndexedLexemes: 1_000_000, maxIndexedChars: 10_000_000 };
 
 Deno.test("onOversize:truncate — 54000 triggers halve-and-retry until it fits", async () => {
 	await withStore(

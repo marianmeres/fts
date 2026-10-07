@@ -131,7 +131,9 @@ const clamp = (n: number, min: number, max: number) =>
 app.get("/api/search", async (_req, _info, ctx) => {
 	const sp = ctx.url.searchParams;
 
-	const q = sp.get("q") ?? "";
+	// The store already caps what reaches PostgreSQL (`maxQueryLexemes` /
+	// `maxQueryChars`); capping the raw input too keeps normalization cheap.
+	const q = (sp.get("q") ?? "").slice(0, 500);
 	const mode = (sp.get("mode") || "prefix") as SearchMode;
 	if (!["prefix", "exact", "fuzzy"].includes(mode)) {
 		ctx.status = 400;

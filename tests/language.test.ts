@@ -77,6 +77,31 @@ Deno.test("default lang is used when omitted; unknown lang throws", async () => 
 	});
 });
 
+Deno.test("fuzzy spans languages unless lang is given; lang is whitelisted there too", async () => {
+	await withStore(MULTI, async (fts) => {
+		await fts.set(T, "s", "en1", { fields: { title: "quantum leap" }, lang: "en" });
+		await fts.set(T, "s", "sk1", { fields: { title: "quantum skok" }, lang: "sk" });
+		const fuzzy = async (lang?: string) => (await fts.search(T, "s", "quantun", {
+			mode: "fuzzy",
+			lang,
+			trgmThreshold: 0.5,
+			withTotal: true,
+		}));
+
+		// trigrams carry no language: by default fuzzy matches rows of every language
+		assertEquals((await fuzzy()).hits.map((h) => h.key).toSorted(), ["en1", "sk1"]);
+
+		// an explicit lang narrows hits AND total (it used to be silently ignored)
+		const en = await fuzzy("en");
+		assertEquals(en.hits.map((h) => h.key), ["en1"]);
+		assertEquals(en.total, 1);
+		assertEquals((await fuzzy("sk")).hits.map((h) => h.key), ["sk1"]);
+
+		// …and goes through the same whitelist as every other mode
+		await assertRejects(() => fuzzy("de"), Error, 'unknown lang "de"');
+	});
+});
+
 Deno.test("compound tokens (§4.2): PG re-splits '@-' whitelisted compounds", async () => {
 	await withStore({ tableName: "fts_l2" }, async (fts) => {
 		await fts.set(T, "s", "k1", { fields: { title: "well-known term" } });

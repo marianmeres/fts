@@ -73,6 +73,29 @@ export function normalizeDoc(
 	return { content, truncated };
 }
 
+/**
+ * Apply the query-side budgets (`maxQueryLexemes`, `maxQueryChars`) to normalized
+ * query groups (one group per query term; alternates inside a group are OR-ed).
+ * Groups are kept in order while both budgets hold; the first group that does not fit
+ * ends the query (dropped whole — never a cut-in-half term).
+ */
+export function clampQueryGroups(
+	groups: string[][],
+	cfg: ResolvedFtsConfig,
+): { groups: string[][]; clamped: boolean } {
+	const out: string[][] = [];
+	let chars = 0;
+	for (const group of groups) {
+		const size = group.reduce((n, w) => n + w.length, 0);
+		if (out.length >= cfg.maxQueryLexemes || chars + size > cfg.maxQueryChars) {
+			return { groups: out, clamped: true };
+		}
+		out.push(group);
+		chars += size;
+	}
+	return { groups: out, clamped: false };
+}
+
 /** Is this the PostgreSQL "string is too long for tsvector" write-time error? */
 // deno-lint-ignore no-explicit-any
 export function isTsvectorOversize(err: any): boolean {
